@@ -18,9 +18,9 @@ def test_github_connection():
     
     # Get configuration
     github_url = os.environ.get("GITHUB_URL", "https://api.github.com")
-    github_token = os.environ.get("GITHUB_TOKEN")
-    repo_owner = os.environ.get("REPO_OWNER")
-    repo_name = os.environ.get("REPO_NAME")
+    github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    repo_owner = os.environ.get("REPO_OWNER", "").strip()
+    repo_name = os.environ.get("REPO_NAME", "").strip()
     
     if not github_token:
         print("❌ GITHUB_TOKEN environment variable not set")

@@ -13,11 +13,15 @@ Environment Variables Required:
 
 Optional Environment Variables:
 - GITHUB_URL: GitHub instance URL (default: https://api.github.com)
-- LABEL: Label to mark bot-created issues (default: auto-generated)
+- LABEL: Bot tracking label to identify bot-created issues (default: auto-generated)
 - ASSIGNEES: Comma-separated GitHub usernames to assign (default: none)
 - POLL_INTERVAL: Sleep interval in seconds for continuous mode (default: 900 = 15min)
+
+Note: The bot will also read and apply labels from each issue's "## Labels" section,
+creating any labels that don't exist in the repository.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -31,10 +35,10 @@ import requests
 
 # Configuration from environment
 GITHUB_URL = os.environ.get("GITHUB_URL", "https://api.github.com")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-REPO_OWNER = os.environ.get("REPO_OWNER")
-REPO_NAME = os.environ.get("REPO_NAME")
-LABEL = os.environ.get("LABEL", "auto-generated")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
+REPO_OWNER = os.environ.get("REPO_OWNER", "").strip()
+REPO_NAME = os.environ.get("REPO_NAME", "").strip()
+LABEL = os.environ.get("LABEL", "auto-generated").strip()
 ASSIGNEES = [u.strip() for u in os.environ.get("ASSIGNEES", "").split(",") if u.strip()]
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "900"))  # 15 minutes
 
@@ -230,6 +234,87 @@ def get_user_ids(usernames: List[str]) -> List[str]:
     
     return valid_usernames
 
+def parse_labels_from_content(content: str) -> List[str]:
+    """Parse labels from the markdown content."""
+    labels = []
+    lines = content.splitlines()
+    
+    # Look for a Labels section
+    in_labels_section = False
+    for line in lines:
+        line = line.strip()
+        
+        # Check for Labels section header
+        if re.match(r"^#+\s*labels?$", line, re.IGNORECASE):
+            in_labels_section = True
+            continue
+        
+        # Check if we've moved to a new section
+        if in_labels_section and line.startswith("#"):
+            break
+        
+        # If we're in the labels section, parse the labels
+        if in_labels_section and line:
+            # Split by commas and clean up
+            label_parts = [l.strip() for l in line.split(",")]
+            for label in label_parts:
+                if label and not label.startswith("#"):  # Ignore empty and comment lines
+                    labels.append(label)
+            break  # Assume labels are on one line after the header
+    
+    return labels
+
+def ensure_labels_exist(labels: List[str]) -> List[str]:
+    """Ensure all labels exist in the repository, create them if they don't."""
+    existing_labels = {}
+    valid_labels = []
+    
+    try:
+        # Get existing labels from the repository
+        repo_labels = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/labels")
+        for label in repo_labels:
+            existing_labels[label["name"].lower()] = label["name"]
+        
+        logger.debug(f"Found {len(existing_labels)} existing labels in repository")
+        
+    except Exception as e:
+        logger.warning(f"Could not fetch existing labels: {e}")
+        # Continue anyway, we'll try to create labels as needed
+    
+    for label in labels:
+        label_clean = label.strip()
+        if not label_clean:
+            continue
+            
+        # Check if label already exists (case-insensitive)
+        if label_clean.lower() in existing_labels:
+            valid_labels.append(existing_labels[label_clean.lower()])
+            logger.debug(f"Label '{label_clean}' already exists")
+        else:
+            # Create the label
+            try:
+                # Generate a color for the label (simple hash-based color)
+                import hashlib
+                color_hash = hashlib.md5(label_clean.encode()).hexdigest()[:6]
+                
+                label_data = {
+                    "name": label_clean,
+                    "color": color_hash,
+                    "description": f"Auto-generated label for {label_clean}"
+                }
+                
+                created_label = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/labels", 
+                                          method="POST", json=label_data)
+                valid_labels.append(created_label["name"])
+                logger.info(f"Created new label: '{label_clean}' with color #{color_hash}")
+                
+            except Exception as e:
+                logger.warning(f"Could not create label '{label_clean}': {e}")
+                # Add it anyway, GitHub might accept it
+                valid_labels.append(label_clean)
+    
+    return valid_labels
+
 def extract_issue_number_from_title(title: str) -> Optional[int]:
     """Extract issue number from a GitHub issue title that might contain prefixes."""
     # Look for patterns like "001-" or just "001" at the start
@@ -259,11 +344,31 @@ def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
         # Rest is the description
         description = "\n".join(lines[1:]).strip() if len(lines) > 1 else ""
         
+        # Parse labels from the content
+        content_labels = parse_labels_from_content(content)
+        logger.debug(f"Parsed labels from content: {content_labels}")
+        
+        # Ensure all labels exist in the repository
+        valid_content_labels = ensure_labels_exist(content_labels) if content_labels else []
+        
+        # Combine bot tracking label with content labels
+        all_labels = [LABEL] + valid_content_labels
+        
+        # Remove duplicates while preserving order
+        unique_labels = []
+        seen = set()
+        for label in all_labels:
+            if label.lower() not in seen:
+                unique_labels.append(label)
+                seen.add(label.lower())
+        
+        logger.info(f"Issue will be created with labels: {unique_labels}")
+        
         # Prepare issue data
         issue_data = {
             "title": title,
             "body": description,  # GitHub uses 'body' instead of 'description'
-            "labels": [LABEL]
+            "labels": unique_labels
         }
         
         # Add assignees if configured
@@ -276,6 +381,9 @@ def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
         new_issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", method="POST", json=issue_data)
         
         logger.info(f"Created issue #{new_issue['number']}: {new_issue['html_url']}")
+        if content_labels:
+            logger.info(f"Applied labels: {unique_labels}")
+        
         return new_issue
     
     except Exception as e:
