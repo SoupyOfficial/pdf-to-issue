@@ -1,0 +1,182 @@
+name: 🧪 GitHub Issue Queue Bot Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Test type to run'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - unit
+          - mock
+          - integration
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Unit Tests Only
+  unit-tests:
+    name: 🔬 Unit Tests Only
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'unit' || github.event.inputs.test_type == 'all' || github.event.inputs.test_type == '' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔬 Run Unit Tests
+      run: |
+        python tests/test_runner.py --unit
+      env:
+        GITHUB_TOKEN: test-token
+        REPO_OWNER: testowner
+        REPO_NAME: testrepo
+
+  # Mock Tests Only
+  mock-tests:
+    name: 🎭 Mock Integration Tests Only
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'mock' || github.event.inputs.test_type == 'all' || github.event.inputs.test_type == '' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🎭 Run Mock Integration Tests
+      run: |
+        python tests/test_runner.py --mock
+      env:
+        GITHUB_TOKEN: test-token
+        REPO_OWNER: testowner
+        REPO_NAME: testrepo
+        LABEL: github-actions-mock
+
+  # Real GitHub Integration Tests (requires secrets)
+  integration-tests:
+    name: 🌐 GitHub Integration Tests
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'integration' }}
+    environment: integration-testing
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🧰 Test GitHub Connection
+      run: |
+        python scripts/test_github.py
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO_OWNER: ${{ secrets.TEST_REPO_OWNER }}
+        REPO_NAME: ${{ secrets.TEST_REPO_NAME }}
+        GITHUB_URL: ${{ secrets.GITHUB_URL || 'https://api.github.com' }}
+        
+    - name: 🌐 Run Integration Tests
+      run: |
+        python tests/test_integration_github.py
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO_OWNER: ${{ secrets.TEST_REPO_OWNER }}
+        REPO_NAME: ${{ secrets.TEST_REPO_NAME }}
+        GITHUB_URL: ${{ secrets.GITHUB_URL || 'https://api.github.com' }}
+        LABEL: github-actions-integration
+
+  # Multi-platform testing
+  cross-platform:
+    name: 🖥️ Cross-Platform Tests
+    runs-on: ${{ matrix.os }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+        exclude:
+          # Reduce matrix size - test fewer combinations
+          - os: macos-latest
+            python-version: '3.8'
+          - os: macos-latest
+            python-version: '3.11'
+          - os: windows-latest
+            python-version: '3.8'
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔬 Run Safe Tests (Unit + Mock)
+      run: |
+        python tests/test_runner.py --all
+      env:
+        GITHUB_TOKEN: test-token
+        REPO_OWNER: testowner
+        REPO_NAME: testrepo
+        LABEL: cross-platform-test
+
+  # Test Summary
+  test-summary:
+    name: 📊 Test Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, mock-tests, cross-platform]
+    if: always()
+    
+    steps:
+    - name: 📊 Report Test Results
+      run: |
+        echo "## 🧪 Test Results Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Type | Status |" >> $GITHUB_STEP_SUMMARY
+        echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+        echo "| Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Mock Integration Tests | ${{ needs.mock-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "| Cross-Platform Tests | ${{ needs.cross-platform.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**GitHub Issue Queue Bot is ready for deployment!** 🚀" >> $GITHUB_STEP_SUMMARY

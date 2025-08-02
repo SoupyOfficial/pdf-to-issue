@@ -1,0 +1,230 @@
+name: 🧪 Test GitLab Issue Queue Bot
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of tests to run'
+        required: true
+        default: 'safe'
+        type: choice
+        options:
+        - safe
+        - unit
+        - mock
+        - integration
+
+env:
+  PYTHON_VERSION: '3.9'
+
+jobs:
+  # Unit and Mock Tests (Safe - no external dependencies)
+  safe-tests:
+    name: 🔬 Unit & Mock Tests
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'safe' || github.event.inputs.test_type == '' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔬 Run Unit Tests
+      run: |
+        python tests/test_runner.py --unit
+      env:
+        GITLAB_TOKEN: test-token
+        PROJECT_ID: 12345
+        
+    - name: 🎭 Run Mock Integration Tests
+      run: |
+        python tests/test_runner.py --mock
+      env:
+        GITLAB_TOKEN: test-token
+        PROJECT_ID: 12345
+        LABEL: github-actions-test
+
+  # Unit Tests Only
+  unit-tests:
+    name: 🧪 Unit Tests Only
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'unit' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔬 Run Unit Tests
+      run: |
+        python tests/test_runner.py --unit
+      env:
+        GITLAB_TOKEN: test-token
+        PROJECT_ID: 12345
+
+  # Mock Tests Only
+  mock-tests:
+    name: 🎭 Mock Integration Tests Only
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'mock' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🎭 Run Mock Integration Tests
+      run: |
+        python tests/test_runner.py --mock
+      env:
+        GITLAB_TOKEN: test-token
+        PROJECT_ID: 12345
+        LABEL: github-actions-mock
+
+  # Real GitLab Integration Tests (requires secrets)
+  integration-tests:
+    name: 🌐 GitLab Integration Tests
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.test_type == 'integration' }}
+    environment: integration-testing
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🧰 Test GitLab Connection
+      run: |
+        python scripts/test_gitlab.py
+      env:
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        PROJECT_ID: ${{ secrets.TEST_PROJECT_ID }}
+        GITLAB_URL: ${{ secrets.GITLAB_URL || 'https://gitlab.com' }}
+        
+    - name: 🌐 Run Integration Tests
+      run: |
+        python tests/test_integration.py
+      env:
+        GITLAB_TOKEN: ${{ secrets.GITLAB_TOKEN }}
+        PROJECT_ID: ${{ secrets.TEST_PROJECT_ID }}
+        GITLAB_URL: ${{ secrets.GITLAB_URL || 'https://gitlab.com' }}
+        LABEL: github-actions-integration
+
+  # Multi-platform testing
+  cross-platform:
+    name: 🖥️ Cross-Platform Tests
+    runs-on: ${{ matrix.os }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+        exclude:
+          # Reduce matrix size - test fewer combinations
+          - os: macos-latest
+            python-version: '3.8'
+          - os: macos-latest  
+            python-version: '3.10'
+        
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: 🔬 Run Unit Tests
+      run: |
+        python tests/test_runner.py --unit
+      env:
+        GITLAB_TOKEN: test-token
+        PROJECT_ID: 12345
+
+  # Code Quality Checks
+  quality-checks:
+    name: 🔍 Code Quality
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+    
+    steps:
+    - name: 📥 Checkout Code
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: 📦 Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install flake8 black isort mypy
+        
+    - name: 🔧 Lint with flake8
+      run: |
+        # Stop the build if there are Python syntax errors or undefined names
+        flake8 scripts/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+        # Exit-zero treats all errors as warnings
+        flake8 scripts/ tests/ --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+        
+    - name: 🎨 Check code formatting with black
+      run: |
+        black --check --diff scripts/ tests/
+        
+    - name: 📦 Check import sorting with isort
+      run: |
+        isort --check-only --diff scripts/ tests/
+        
+    - name: 🔍 Type checking with mypy
+      run: |
+        mypy scripts/ --ignore-missing-imports
+      continue-on-error: true
