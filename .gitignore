@@ -1,0 +1,5 @@
+.venv/
+.vscode/
+logs/
+scripts/__pycache__/
+issues/*.md
