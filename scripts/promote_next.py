@@ -80,8 +80,68 @@ logger = logging.getLogger(__name__)
 # Cache for user ID lookups
 _user_id_cache = {}
 
+def get_copilot_agent_info() -> Optional[Dict[str, Any]]:
+    """Get Copilot coding agent information from the repository."""
+    query = """
+    query GetCopilotAgent($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        id
+        suggestedActors(capabilities: [CAN_BE_ASSIGNED], first: 100) {
+          nodes {
+            login
+            __typename
+            ... on Bot {
+              id
+            }
+            ... on User {
+              id
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    variables = {
+        "owner": REPO_OWNER,
+        "name": REPO_NAME
+    }
+    
+    try:
+        data = graphql_request(query, variables)
+        repository = data.get("repository")
+        
+        if not repository:
+            logger.error(f"Repository {REPO_OWNER}/{REPO_NAME} not found")
+            return None
+        
+        repo_id = repository["id"]
+        suggested_actors = repository.get("suggestedActors", {}).get("nodes", [])
+        
+        # Look for Copilot coding agent
+        copilot_agent = None
+        for actor in suggested_actors:
+            if actor.get("login") == "copilot-swe-agent":
+                copilot_agent = actor
+                break
+        
+        if not copilot_agent:
+            logger.warning("Copilot coding agent not found in suggested actors")
+            logger.debug(f"Available actors: {[(a.get('login'), a.get('__typename')) for a in suggested_actors]}")
+            return None
+        
+        return {
+            "repository_id": repo_id,
+            "copilot_id": copilot_agent["id"],
+            "copilot_login": copilot_agent["login"]
+        }
+    
+    except Exception as e:
+        logger.error(f"Failed to get Copilot agent info: {e}")
+        return None
+
 def validate_environment():
-    """Validate required environment variables."""
+    """Validate required environment variables and Copilot availability."""
     if not GITHUB_TOKEN:
         logger.error("GITHUB_TOKEN environment variable is required")
         sys.exit(1)
@@ -97,6 +157,16 @@ def validate_environment():
     logger.info(f"Configuration: GitHub URL={GITHUB_URL}, Repository={REPO_OWNER}/{REPO_NAME}, Label={LABEL}")
     if ASSIGNEES:
         logger.info(f"Default assignees: {ASSIGNEES}")
+    
+    # Check Copilot availability
+    copilot_info = get_copilot_agent_info()
+    if not copilot_info:
+        logger.error("Copilot coding agent is not available in this repository")
+        logger.error("Please ensure Copilot is enabled for your account and repository")
+        sys.exit(1)
+    
+    logger.info(f"✅ Copilot coding agent available: {copilot_info['copilot_login']}")
+    return copilot_info
 
 def api_request(path: str, method: str = "GET", **kwargs) -> Any:
     """Make an API request to GitHub."""
@@ -128,6 +198,41 @@ def api_request(path: str, method: str = "GET", **kwargs) -> Any:
                 logger.error(f"API error details: {error_detail}")
             except:
                 logger.error(f"API error response: {e.response.text}")
+        raise
+
+def graphql_request(query: str, variables: Optional[Dict[str, Any]] = None) -> Any:
+    """Make a GraphQL request to GitHub."""
+    url = f"{GITHUB_URL}/graphql" if GITHUB_URL == "https://api.github.com" else f"{GITHUB_URL}/api/graphql"
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "GitHub-Issue-Queue-Bot/1.0"
+    }
+    
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    
+    try:
+        response = requests.post(url, headers=headers, json=payload)
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if "errors" in result:
+            logger.error(f"GraphQL errors: {result['errors']}")
+            raise Exception(f"GraphQL errors: {result['errors']}")
+        
+        return result.get("data")
+    
+    except requests.exceptions.RequestException as e:
+        logger.error(f"GraphQL request failed: {e}")
+        if hasattr(e, 'response') and e.response is not None:
+            try:
+                error_detail = e.response.json()
+                logger.error(f"GraphQL error details: {error_detail}")
+            except:
+                logger.error(f"GraphQL error response: {e.response.text}")
         raise
 
 def get_last_bot_issue() -> Optional[Dict[str, Any]]:
@@ -198,96 +303,139 @@ def get_closing_pr_for_issue(issue_number: int) -> Optional[Dict[str, Any]]:
 def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
     """
     Check the current status of the Copilot workflow for an issue.
-    Returns: 'waiting_for_pr', 'pr_in_progress', 'pr_ready_for_review', 'pr_approved', 'completed'
+    Returns: 'waiting_for_copilot', 'copilot_working', 'pr_ready_for_review', 'completed'
     """
     issue_number = issue["number"]
-    issue_title = issue["title"]
     
     # If issue is closed, it's completed
     if issue["state"] == "closed":
         return "completed"
     
-    # Look for PRs that reference this issue (multiple detection methods)
-    prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
-        "state": "all",
-        "sort": "updated",
-        "direction": "desc",
-        "per_page": 50  # Check more PRs
-    })
+    # Check if Copilot is assigned to the issue
+    assignees = issue.get("assignees", [])
+    copilot_assigned = any(a.get("login") == "copilot-swe-agent" for a in assignees)
     
-    related_pr = None
-    for pr in prs:
-        # Method 1: Check if PR body or title mentions the issue number
-        pr_text = f"{pr['title']} {pr['body'] or ''}".lower()
-        if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
-            related_pr = pr
-            logger.debug(f"Found PR #{pr['number']} referencing issue #{issue_number} by number")
-            break
-        
-        # Method 2: Check if PR title matches or contains the issue title
-        pr_title_lower = pr['title'].lower()
-        issue_title_lower = issue_title.lower()
-        
-        # Extract the core title (remove number prefix if present)
-        core_issue_title = re.sub(r'^\d+[-\s]*', '', issue_title_lower).strip()
-        
-        if (core_issue_title in pr_title_lower or 
-            pr_title_lower in issue_title_lower or
-            # Check for similar titles (at least 70% match in words)
-            len(set(core_issue_title.split()) & set(pr_title_lower.split())) >= len(core_issue_title.split()) * 0.7):
-            related_pr = pr
-            logger.debug(f"Found PR #{pr['number']} with matching title for issue #{issue_number}")
-            break
+    if not copilot_assigned:
+        logger.debug(f"Copilot not assigned to issue #{issue_number}")
+        return "waiting_for_copilot"
     
-    if not related_pr:
-        logger.debug(f"No PR found for issue #{issue_number} - waiting for Copilot to create PR")
-        return "waiting_for_pr"
-    
-    pr_number = related_pr["number"]
-    logger.info(f"Found related PR #{pr_number} ('{related_pr['title']}') for issue #{issue_number}")
-    
-    # Check PR status
-    if related_pr["state"] == "closed":
-        if related_pr["merged"]:
-            return "completed"
-        else:
-            logger.warning(f"PR #{pr_number} was closed without merging")
-            return "completed"  # Consider it done even if not merged
-    
-    # PR is still open - check review status
+    # Look for timeline events to understand Copilot's status
     try:
-        reviews = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/reviews")
+        timeline_events = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{issue_number}/timeline")
         
-        # Check if there are any reviews
-        approved_reviews = [r for r in reviews if r["state"] == "APPROVED"]
+        # Look for Copilot-related events
+        copilot_started = False
+        copilot_finished = False
+        eyes_reaction = False
         
-        if approved_reviews:
-            logger.info(f"PR #{pr_number} has been approved - ready to merge")
-            return "pr_approved"
+        for event in timeline_events:
+            event_type = event.get("event")
+            actor = event.get("actor", {})
+            actor_login = actor.get("login", "")
+            
+            # Check for eyes reaction from Copilot (indicates acknowledgment)
+            if event_type == "subscribed" and actor_login == "copilot-swe-agent":
+                eyes_reaction = True
+                logger.debug(f"Found Copilot acknowledgment for issue #{issue_number}")
+            
+            # Check for "Copilot started work" type events
+            # These appear as comments or other timeline events
+            if event_type in ["commented", "cross-referenced"] and actor_login == "copilot-swe-agent":
+                body = event.get("body", "").lower()
+                if "started work" in body or "working on" in body:
+                    copilot_started = True
+                    logger.debug(f"Found Copilot work start event for issue #{issue_number}")
+                
+                if "finished work" in body or "completed" in body:
+                    copilot_finished = True
+                    logger.debug(f"Found Copilot work completion event for issue #{issue_number}")
         
-        # Check if PR is ready for review (has commits and is not draft)
-        if related_pr["draft"]:
-            logger.debug(f"PR #{pr_number} is still in draft - Copilot is still working")
-            return "pr_in_progress"
+        # Look for linked pull requests
+        linked_prs = []
+        try:
+            # Check for pull requests that reference this issue
+            prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
+                "state": "all",
+                "sort": "updated",
+                "direction": "desc",
+                "per_page": 20
+            })
+            
+            for pr in prs:
+                pr_body = pr.get("body", "") or ""
+                pr_title = pr.get("title", "")
+                
+                # Check if PR references this issue
+                if (f"#{issue_number}" in pr_body or f"#{issue_number}" in pr_title or
+                    f"issue {issue_number}" in pr_body.lower() or 
+                    f"fixes #{issue_number}" in pr_body.lower() or
+                    f"closes #{issue_number}" in pr_body.lower()):
+                    
+                    # Check if PR is from Copilot
+                    pr_author = pr.get("user", {}).get("login", "")
+                    if pr_author == "copilot-swe-agent":
+                        linked_prs.append(pr)
+                        logger.debug(f"Found Copilot PR #{pr['number']} linked to issue #{issue_number}")
         
-        # Check if there are any review requests
-        requested_reviewers = related_pr.get("requested_reviewers", [])
-        if requested_reviewers:
-            logger.info(f"PR #{pr_number} is ready for review")
-            return "pr_ready_for_review"
+        except Exception as e:
+            logger.warning(f"Could not check for linked PRs: {e}")
         
-        logger.debug(f"PR #{pr_number} exists but no review requested yet")
-        return "pr_in_progress"
+        # Determine status based on what we found
+        if linked_prs:
+            # Check the status of the most recent linked PR
+            latest_pr = max(linked_prs, key=lambda x: x["updated_at"])
+            pr_state = latest_pr["state"]
+            
+            if pr_state == "closed":
+                if latest_pr.get("merged"):
+                    return "completed"
+                else:
+                    logger.warning(f"Copilot PR #{latest_pr['number']} was closed without merging")
+                    return "completed"  # Consider it done
+            
+            elif pr_state == "open":
+                # Check if PR is ready for review
+                if latest_pr.get("draft"):
+                    logger.debug(f"Copilot PR #{latest_pr['number']} is still in draft")
+                    return "copilot_working"
+                
+                # Check review requests
+                try:
+                    pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{latest_pr['number']}")
+                    requested_reviewers = pr_details.get("requested_reviewers", [])
+                    
+                    if requested_reviewers:
+                        logger.info(f"Copilot PR #{latest_pr['number']} is ready for review")
+                        return "pr_ready_for_review"
+                    else:
+                        return "copilot_working"
+                
+                except Exception as e:
+                    logger.warning(f"Could not check PR review status: {e}")
+                    return "copilot_working"
         
+        elif copilot_started and not copilot_finished:
+            return "copilot_working"
+        
+        elif eyes_reaction:
+            return "copilot_working"  # Copilot acknowledged but no PR yet
+        
+        else:
+            return "waiting_for_copilot"  # Assigned but no activity yet
+    
     except Exception as e:
-        logger.warning(f"Could not check review status for PR #{pr_number}: {e}")
-        return "pr_in_progress"
+        logger.warning(f"Could not check timeline for issue #{issue_number}: {e}")
+        # Fallback to simple assignee check
+        if copilot_assigned:
+            return "copilot_working"
+        else:
+            return "waiting_for_copilot"
 
 def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
     """Auto-approve and merge the PR associated with an issue."""
     issue_number = issue["number"]
     
-    # Find the related PR
+    # Find the related PR created by Copilot
     prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
         "state": "open",
         "sort": "updated",
@@ -296,13 +444,16 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
     
     related_pr = None
     for pr in prs:
-        pr_text = f"{pr['title']} {pr['body'] or ''}".lower()
-        if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
-            related_pr = pr
-            break
+        # Check if PR is from Copilot and references this issue
+        pr_author = pr.get("user", {}).get("login", "")
+        if pr_author == "copilot-swe-agent":
+            pr_text = f"{pr['title']} {pr['body'] or ''}".lower()
+            if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
+                related_pr = pr
+                break
     
     if not related_pr:
-        logger.error(f"No open PR found for issue #{issue_number}")
+        logger.error(f"No open Copilot PR found for issue #{issue_number}")
         return False
     
     pr_number = related_pr["number"]
@@ -314,7 +465,7 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
             "event": "APPROVE"
         }
         
-        logger.info(f"Auto-approving PR #{pr_number}")
+        logger.info(f"Auto-approving Copilot PR #{pr_number}")
         api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/reviews", 
                    method="POST", json=review_data)
         
@@ -325,18 +476,18 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
             "merge_method": "squash"  # Use squash merge for cleaner history
         }
         
-        logger.info(f"Auto-merging PR #{pr_number}")
+        logger.info(f"Auto-merging Copilot PR #{pr_number}")
         merge_result = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/merge", 
                                  method="PUT", json=merge_data)
         
         if merge_result:
-            logger.info(f"Successfully merged PR #{pr_number}: {merge_result.get('message', 'Success')}")
+            logger.info(f"✅ Successfully merged Copilot PR #{pr_number}: {merge_result.get('message', 'Success')}")
         else:
-            logger.info(f"Successfully merged PR #{pr_number}")
+            logger.info(f"✅ Successfully merged Copilot PR #{pr_number}")
         return True
         
     except Exception as e:
-        logger.error(f"Failed to auto-approve/merge PR #{pr_number}: {e}")
+        logger.error(f"Failed to auto-approve/merge Copilot PR #{pr_number}: {e}")
         return False
 
 def get_next_file(after_issue_number: Optional[int] = None) -> Optional[pathlib.Path]:
@@ -370,24 +521,22 @@ def get_next_file(after_issue_number: Optional[int] = None) -> Optional[pathlib.
     logger.info(f"No file found after number {after_issue_number:03d}")
     return None
 
-def get_user_ids(usernames: List[str]) -> List[str]:
-    """Get GitHub usernames (GitHub uses usernames directly, not IDs for assignment)."""
+def get_additional_assignee_ids(usernames: List[str]) -> List[str]:
+    """Get GitHub usernames for additional assignees (not Copilot)."""
     valid_usernames = []
-    logger.debug(f"Validating usernames for assignment: {usernames}")
+    logger.debug(f"Validating additional assignees: {usernames}")
     
     for username in usernames:
         logger.debug(f"Checking username: '{username}'")
         
+        # Skip Copilot-related usernames as they're handled separately
+        if username.lower() in ["copilot", "copilot-swe-agent"]:
+            logger.debug(f"Skipping '{username}' - handled separately via GraphQL")
+            continue
+        
         if username in _user_id_cache:
             valid_usernames.append(username)
             logger.debug(f"Username '{username}' found in cache")
-            continue
-        
-        # Special case: Always allow "copilot" as it's a system user for GitHub Copilot
-        if username.lower() == "copilot":
-            logger.info(f"Adding '{username}' as assignee (GitHub Copilot system user)")
-            valid_usernames.append(username)
-            _user_id_cache[username] = username
             continue
         
         try:
@@ -400,18 +549,9 @@ def get_user_ids(usernames: List[str]) -> List[str]:
             else:
                 logger.warning(f"User '{username}' not found - API returned invalid response")
         except Exception as e:
-            # For special accounts like Copilot, GitHub might not have a regular user profile
-            # but they can still be assigned to issues
-            logger.debug(f"API validation failed for '{username}': {e}")
-            error_str = str(e).lower()
-            if ("404" in error_str or "401" in error_str) and "copilot" in username.lower():
-                logger.info(f"Adding '{username}' as assignee (GitHub Copilot may not have a public profile)")
-                valid_usernames.append(username)
-                _user_id_cache[username] = username
-            else:
-                logger.warning(f"Failed to lookup user '{username}': {e}")
+            logger.warning(f"Failed to lookup user '{username}': {e}")
     
-    logger.debug(f"Final valid usernames: {valid_usernames}")
+    logger.debug(f"Final valid additional assignees: {valid_usernames}")
     return valid_usernames
 
 def parse_labels_from_content(content: str) -> List[str]:
@@ -521,8 +661,8 @@ def extract_issue_number_from_title(title: str) -> Optional[int]:
     
     return None
 
-def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
-    """Create a GitHub issue from a markdown file."""
+def create_issue(file_path: pathlib.Path, copilot_info: Dict[str, Any]) -> Dict[str, Any]:
+    """Create a GitHub issue from a markdown file and assign to Copilot."""
     try:
         content = file_path.read_text(encoding="utf-8")
         lines = content.splitlines()
@@ -543,8 +683,8 @@ def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
         # Ensure all labels exist in the repository
         valid_content_labels = ensure_labels_exist(content_labels) if content_labels else []
         
-        # Combine bot tracking label with content labels (removed "copilot" label as it was interfering with assignments)
-        enhancement_labels = ["enhancement"]  # Labels that help categorize the issue
+        # Combine bot tracking label with content labels
+        enhancement_labels = ["enhancement"]
         all_labels = [LABEL] + valid_content_labels + enhancement_labels
         
         # Remove duplicates while preserving order
@@ -557,114 +697,179 @@ def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
         
         logger.info(f"Issue will be created with labels: {unique_labels}")
         
-        # Add Copilot as primary assignee, plus any additional assignees
-        all_assignees = []
-        logger.debug("Adding 'copilot' as primary assignee")
-        logger.debug(f"Additional ASSIGNEES from environment: {ASSIGNEES}")
+        # Get additional assignees (non-Copilot)
+        additional_assignees = []
+        if ASSIGNEES:
+            logger.debug(f"Additional ASSIGNEES from environment: {ASSIGNEES}")
+            additional_assignees = get_additional_assignee_ids(ASSIGNEES)
+            logger.debug(f"Valid additional assignees: {additional_assignees}")
         
-        # Always add copilot as the primary assignee
-        all_assignees.append("copilot")
-        logger.debug("Added Copilot assignee: 'copilot'")
-            
-        all_assignees.extend(ASSIGNEES)
-        logger.debug(f"All assignees before deduplication: {all_assignees}")
+        # Create issue using GraphQL with Copilot assignment
+        query = """
+        mutation CreateIssueWithCopilot($repositoryId: ID!, $title: String!, $body: String!, $assigneeIds: [ID!]!, $labelIds: [ID!]) {
+          createIssue(input: {repositoryId: $repositoryId, title: $title, body: $body, assigneeIds: $assigneeIds, labelIds: $labelIds}) {
+            issue {
+              id
+              number
+              title
+              url
+              assignees(first: 10) {
+                nodes {
+                  login
+                  id
+                }
+              }
+              labels(first: 20) {
+                nodes {
+                  name
+                  color
+                }
+              }
+            }
+          }
+        }
+        """
         
-        # Remove duplicates while preserving order
-        unique_assignees = []
-        seen = set()
-        for assignee in all_assignees:
-            if assignee and assignee.lower() not in seen:
-                unique_assignees.append(assignee)
-                seen.add(assignee.lower())
+        # Get label IDs for GraphQL
+        label_ids = []
+        if unique_labels:
+            try:
+                # First, get existing labels to find their IDs
+                existing_labels = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/labels")
+                label_id_map = {label["name"]: label["node_id"] for label in existing_labels}
+                
+                for label_name in unique_labels:
+                    if label_name in label_id_map:
+                        label_ids.append(label_id_map[label_name])
+                        logger.debug(f"Found ID for label '{label_name}'")
+                    else:
+                        logger.warning(f"Could not find ID for label '{label_name}' - it may not exist yet")
+            except Exception as e:
+                logger.warning(f"Could not get label IDs: {e}")
         
-        logger.debug(f"Unique assignees after deduplication: {unique_assignees}")
+        # Prepare assignee IDs - Copilot first, then additional assignees
+        assignee_ids = [copilot_info["copilot_id"]]
         
-        # Validate assignees
-        valid_assignees = []
-        if unique_assignees:
-            logger.debug(f"Attempting to validate {len(unique_assignees)} assignees: {unique_assignees}")
-            valid_assignees = get_user_ids(unique_assignees)
-            logger.debug(f"Validation result: {len(valid_assignees)} valid assignees: {valid_assignees}")
+        # Note: Additional assignees would need their GraphQL IDs, but for now we'll focus on Copilot
+        # The GraphQL API requires node IDs, not usernames for additional assignees
         
-        # Prepare issue data according to GitHub API v2022-11-28
-        issue_data = {
+        variables = {
+            "repositoryId": copilot_info["repository_id"],
             "title": title,
-            "body": description,  # GitHub API uses 'body' not 'description'
-            "labels": unique_labels
+            "body": description,
+            "assigneeIds": assignee_ids,
+            "labelIds": label_ids
         }
         
-        # Add assignees if we have valid ones
-        if valid_assignees:
-            issue_data["assignees"] = valid_assignees
-            logger.info(f"Will assign issue to: {valid_assignees}")
-        else:
-            logger.debug("No assignees specified - issue will be created unassigned")
+        logger.info(f"Creating issue with Copilot assignment: {title}")
+        logger.debug(f"GraphQL variables: {json.dumps({k: v for k, v in variables.items() if k != 'repositoryId'}, indent=2)}")
         
-        logger.info(f"Creating issue: {title}")
-        logger.debug(f"Issue creation payload: {json.dumps(issue_data, indent=2)}")
-        
-        # Try to create the issue with proper error handling
         try:
-            logger.debug("Attempting to create issue with GitHub API...")
-            new_issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", method="POST", json=issue_data)
-            logger.debug(f"Issue creation successful. Response ID: {new_issue.get('number', 'unknown')}")
+            logger.debug("Attempting to create issue with GraphQL...")
+            data = graphql_request(query, variables)
+            new_issue_data = data["createIssue"]["issue"]
+            
+            # Convert GraphQL response to REST API format for compatibility
+            new_issue = {
+                "number": new_issue_data["number"],
+                "title": new_issue_data["title"],
+                "html_url": new_issue_data["url"],
+                "assignees": new_issue_data["assignees"]["nodes"],
+                "labels": new_issue_data["labels"]["nodes"],
+                "state": "open"
+            }
+            
+            logger.info(f"✅ Created issue #{new_issue['number']}: {new_issue['html_url']}")
+            
         except Exception as e:
-            logger.debug(f"Issue creation failed with error: {e}")
-            error_str = str(e).lower()
-            if ("assignee" in error_str or "assignees" in error_str) and ("invalid" in error_str or "not found" in error_str):
-                logger.warning(f"Assignee validation failed during issue creation: {e}")
-                logger.info("Retrying issue creation without assignees")
-                # Remove assignees and try again
-                issue_data_no_assignees = issue_data.copy()
-                issue_data_no_assignees.pop("assignees", None)
-                logger.debug(f"Retry payload (no assignees): {json.dumps(issue_data_no_assignees, indent=2)}")
-                new_issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", method="POST", json=issue_data_no_assignees)
-                logger.info("✅ Issue created successfully without assignees (Copilot can self-assign when starting work)")
-            else:
-                logger.error(f"Issue creation failed with non-assignee error: {e}")
-                raise
-        
-        logger.info(f"Created issue #{new_issue['number']}: {new_issue['html_url']}")
+            logger.error(f"GraphQL issue creation failed: {e}")
+            # Fallback to REST API without Copilot assignment
+            logger.info("Falling back to REST API issue creation...")
+            
+            issue_data = {
+                "title": title,
+                "body": description,
+                "labels": unique_labels
+            }
+            
+            if additional_assignees:
+                issue_data["assignees"] = additional_assignees
+                logger.info(f"Will assign to additional assignees: {additional_assignees}")
+            
+            new_issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", method="POST", json=issue_data)
+            logger.info(f"Created issue #{new_issue['number']}: {new_issue['html_url']}")
+            
+            # Now try to assign Copilot using GraphQL
+            try:
+                assign_query = """
+                mutation AssignCopilot($assignableId: ID!, $actorIds: [ID!]!) {
+                  replaceActorsForAssignable(input: {assignableId: $assignableId, actorIds: $actorIds}) {
+                    assignable {
+                      ... on Issue {
+                        id
+                        number
+                        assignees(first: 10) {
+                          nodes {
+                            login
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                """
+                
+                # Get the GraphQL ID for the issue
+                issue_query = """
+                query GetIssueId($owner: String!, $name: String!, $number: Int!) {
+                  repository(owner: $owner, name: $name) {
+                    issue(number: $number) {
+                      id
+                    }
+                  }
+                }
+                """
+                
+                issue_data_result = graphql_request(issue_query, {
+                    "owner": REPO_OWNER,
+                    "name": REPO_NAME,
+                    "number": new_issue["number"]
+                })
+                
+                issue_id = issue_data_result["repository"]["issue"]["id"]
+                
+                # Assign Copilot
+                assign_variables = {
+                    "assignableId": issue_id,
+                    "actorIds": [copilot_info["copilot_id"]]
+                }
+                
+                logger.info("Assigning Copilot to existing issue...")
+                assign_result = graphql_request(assign_query, assign_variables)
+                
+                if assign_result:
+                    assigned_logins = [a["login"] for a in assign_result["replaceActorsForAssignable"]["assignable"]["assignees"]["nodes"]]
+                    logger.info(f"✅ Successfully assigned to: {assigned_logins}")
+                
+            except Exception as assign_error:
+                logger.error(f"Failed to assign Copilot after issue creation: {assign_error}")
+                logger.warning("Issue created but Copilot assignment failed - manual assignment may be needed")
         
         # Debug: Check actual assignments
         actual_assignees = new_issue.get('assignees', [])
         if actual_assignees:
             assignee_logins = [a.get('login', 'unknown') for a in actual_assignees]
-            logger.info(f"✅ Successfully assigned to: {assignee_logins}")
-            logger.debug(f"Assignment details: {[{k: v for k, v in a.items() if k in ['login', 'id', 'type']} for a in actual_assignees]}")
+            logger.info(f"✅ Final issue assignees: {assignee_logins}")
         else:
-            logger.warning("⚠️ Issue created without any assignees")
-            if unique_assignees:
-                logger.warning(f"Originally attempted to assign to: {unique_assignees}")
+            logger.warning("⚠️ Issue has no assignees")
         
         if content_labels:
             applied_labels = new_issue.get('labels', [])
             applied_label_names = [l.get('name', 'unknown') for l in applied_labels]
             logger.info(f"Applied labels: {applied_label_names}")
-            logger.debug(f"Label details: {[{k: v for k, v in l.items() if k in ['name', 'color', 'description']} for l in applied_labels]}")
         
-        # Add a comment to trigger GitHub Copilot
-        try:
-            comment_body = (
-                "@github-copilot please implement this feature\n\n"
-                "🤖 **GitHub Copilot - Please implement this feature**\n\n"
-                "This issue has been automatically created by the GitHub Issue Queue Bot. "
-                "Please create a pull request to implement the requirements described above.\n\n"
-                "**Next Steps:**\n"
-                "1. Create a new branch for this feature\n"
-                "2. Implement the requirements\n"
-                "3. Create a pull request referencing this issue\n"
-                "4. Request review when ready\n\n"
-                f"Issue tracking label: `{LABEL}`\n\n"
-                "/copilot implement"
-            )
-            
-            api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{new_issue['number']}/comments",
-                       method="POST", json={"body": comment_body})
-            logger.info("✅ Added GitHub Copilot trigger comment to issue")
-            
-        except Exception as e:
-            logger.warning(f"Could not add comment to issue: {e}")
+        # Don't add a comment - Copilot will automatically start working when assigned
+        logger.info("✅ Copilot will automatically start working on this issue")
         
         return new_issue
     
@@ -672,9 +877,9 @@ def create_issue(file_path: pathlib.Path) -> Dict[str, Any]:
         logger.error(f"Failed to create issue from {file_path}: {e}")
         raise
 
-def promote_next_issue() -> bool:
+def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
     """
-    Main logic: check if we can promote the next issue through the full Copilot workflow.
+    Main logic: check if we can promote the next issue through the Copilot workflow.
     Returns True if an issue was created or workflow advanced, False if waiting.
     """
     logger.info("Checking for next issue to promote...")
@@ -689,26 +894,16 @@ def promote_next_issue() -> bool:
         workflow_status = check_copilot_workflow_status(last_issue)
         logger.info(f"Current workflow status: {workflow_status}")
         
-        if workflow_status == "waiting_for_pr":
-            logger.info("Waiting for Copilot to create pull request...")
+        if workflow_status == "waiting_for_copilot":
+            logger.info("Issue assigned but Copilot hasn't started working yet...")
             return False
         
-        elif workflow_status == "pr_in_progress":
-            logger.info("Copilot is still working on the pull request...")
+        elif workflow_status == "copilot_working":
+            logger.info("Copilot is actively working on the issue...")
             return False
         
         elif workflow_status == "pr_ready_for_review":
             logger.info("Pull request is ready for review - auto-approving and merging...")
-            success = auto_approve_and_merge_pr(last_issue)
-            if success:
-                logger.info("Pull request merged successfully - workflow advancing")
-                return True
-            else:
-                logger.error("Failed to merge pull request - will retry")
-                return False
-        
-        elif workflow_status == "pr_approved":
-            logger.info("Pull request already approved - attempting to merge...")
             success = auto_approve_and_merge_pr(last_issue)
             if success:
                 logger.info("Pull request merged successfully - workflow advancing")
@@ -743,11 +938,11 @@ def promote_next_issue() -> bool:
         logger.info("Queue is empty - no more issues to promote")
         return False
     
-    # 4. Create the new issue
+    # 4. Create the new issue with Copilot assignment
     try:
-        new_issue = create_issue(next_file)
-        logger.info("✅ New issue created and assigned to copilot")
-        logger.info(f"🤖 Waiting for Copilot to begin work on issue #{new_issue['number']}")
+        new_issue = create_issue(next_file, copilot_info)
+        logger.info("✅ New issue created and assigned to Copilot")
+        logger.info(f"🤖 Copilot will automatically start working on issue #{new_issue['number']}")
         return True
     except Exception as e:
         logger.error(f"Failed to create issue: {e}")
@@ -755,18 +950,18 @@ def promote_next_issue() -> bool:
 
 def main():
     """Main entry point."""
-    validate_environment()
+    copilot_info = validate_environment()
     
     # Check if we're in continuous mode
     continuous = "--continuous" in sys.argv or "--daemon" in sys.argv
     
     if continuous:
         logger.info(f"🔄 Starting continuous Copilot workflow mode (polling every {POLL_INTERVAL} seconds)")
-        logger.info("🤖 Copilot assignee: copilot")
+        logger.info(f"🤖 Copilot coding agent: {copilot_info['copilot_login']}")
         
         while True:
             try:
-                activity = promote_next_issue()
+                activity = promote_next_issue(copilot_info)
                 if activity:
                     logger.info("📈 Workflow activity detected - continuing monitoring")
                 else:
@@ -782,8 +977,8 @@ def main():
     else:
         # Single run mode
         logger.info("🚀 Running single Copilot workflow check")
-        logger.info("🤖 Copilot assignee: copilot")
-        success = promote_next_issue()
+        logger.info(f"🤖 Copilot coding agent: {copilot_info['copilot_login']}")
+        success = promote_next_issue(copilot_info)
         sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
