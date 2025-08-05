@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Test GitHub API Connection
-==========================
+Test API Connection
+==================
 
-Quick test script to validate GitHub API credentials and repository access.
+Quick test script to validate API credentials and repository access.
 """
 
 import os
@@ -13,8 +13,8 @@ from pathlib import Path
 import requests
 
 
-def test_github_connection():
-    """Test GitHub API connection and permissions."""
+def test_api_connection():
+    """Test API connection and permissions."""
     
     # Get configuration
     github_url = os.environ.get("GITHUB_URL", "https://api.github.com")
@@ -140,10 +140,10 @@ def test_github_connection():
 
 def main():
     """Main entry point."""
-    print("🧪 GitHub Issue Queue Bot - Connection Test")
+    print("🧪 Issue Queue Bot - Connection Test")
     print("=" * 50)
     
-    success = test_github_connection()
+    success = test_api_connection()
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":

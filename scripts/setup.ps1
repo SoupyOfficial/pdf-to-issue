@@ -1,22 +1,24 @@
-# GitLab Issue Queue Bot - Windows Setup Script
+# Issue Queue Bot - Windows Setup Script
 # Run this script in PowerShell to set up the bot
 
 param(
-    [string]$GitLabToken = "",
-    [string]$ProjectId = "",
-    [string]$GitLabUrl = "https://gitlab.com",
+    [string]$GitHubToken = "",
+    [string]$RepoOwner = "",
+    [string]$RepoName = "",
+    [string]$GitHubUrl = "https://api.github.com",
     [string]$Label = "auto-generated",
     [string]$Assignees = ""
 )
 
-Write-Host "🤖 GitLab Issue Queue Bot Setup" -ForegroundColor Cyan
-Write-Host "=================================" -ForegroundColor Cyan
+Write-Host "🤖 Issue Queue Bot Setup" -ForegroundColor Cyan
+Write-Host "=========================" -ForegroundColor Cyan
 
 # Check Python installation
 try {
     $pythonVersion = python --version 2>&1
     Write-Host "✅ Python found: $pythonVersion" -ForegroundColor Green
-} catch {
+}
+catch {
     Write-Host "❌ Python not found. Please install Python 3.7+ first." -ForegroundColor Red
     exit 1
 }
@@ -41,18 +43,23 @@ Write-Host "✅ Dependencies installed successfully" -ForegroundColor Green
 if (-not (Test-Path ".env")) {
     Write-Host "`n📝 Creating .env configuration file..." -ForegroundColor Yellow
     
-    if ($GitLabToken -eq "") {
-        $GitLabToken = Read-Host "Enter your GitLab Personal Access Token"
+    if ($GitHubToken -eq "") {
+        $GitHubToken = Read-Host "Enter your GitHub Personal Access Token"
     }
     
-    if ($ProjectId -eq "") {
-        $ProjectId = Read-Host "Enter your GitLab Project ID (numeric)"
+    if ($RepoOwner -eq "") {
+        $RepoOwner = Read-Host "Enter your Repository Owner (username or organization)"
+    }
+    
+    if ($RepoName -eq "") {
+        $RepoName = Read-Host "Enter your Repository Name"
     }
     
     $envContent = @"
-GITLAB_TOKEN=$GitLabToken
-PROJECT_ID=$ProjectId
-GITLAB_URL=$GitLabUrl
+GITHUB_TOKEN=$GitHubToken
+REPO_OWNER=$RepoOwner
+REPO_NAME=$RepoName
+GITHUB_URL=$GitHubUrl
 LABEL=$Label
 ASSIGNEES=$Assignees
 POLL_INTERVAL=900
@@ -60,12 +67,13 @@ POLL_INTERVAL=900
     
     $envContent | Out-File -FilePath ".env" -Encoding UTF8
     Write-Host "✅ Created .env file" -ForegroundColor Green
-} else {
+}
+else {
     Write-Host "✅ .env file already exists" -ForegroundColor Green
 }
 
 # Test the connection
-Write-Host "`n🧪 Testing GitLab connection..." -ForegroundColor Yellow
+Write-Host "`n🧪 Testing API connection..." -ForegroundColor Yellow
 
 # Load environment variables from .env file
 if (Test-Path ".env") {
@@ -75,7 +83,7 @@ if (Test-Path ".env") {
     }
 }
 
-python scripts/test_gitlab.py
+python scripts/test_connection.py
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "`n🎉 Setup completed successfully!" -ForegroundColor Green
@@ -83,8 +91,9 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host "1. Add some .md files to the issues/ directory" -ForegroundColor White
     Write-Host "2. Run a test promotion: python scripts/promote_next.py" -ForegroundColor White
     Write-Host "3. For continuous mode: python scripts/promote_next.py --continuous" -ForegroundColor White
-    Write-Host "4. Set up GitLab CI/CD schedule for automation" -ForegroundColor White
-} else {
+    Write-Host "4. Set up GitHub Actions for automation" -ForegroundColor White
+}
+else {
     Write-Host "`n❌ Setup completed but connection test failed" -ForegroundColor Red
-    Write-Host "Please check your GitLab token and project ID" -ForegroundColor Yellow
+    Write-Host "Please check your token and repository settings" -ForegroundColor Yellow
 }

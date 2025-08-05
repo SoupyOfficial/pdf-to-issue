@@ -1,59 +1,45 @@
-# Testing Strategy for GitLab Issue Queue Bot
+# Testing Strategy for Issue Queue Bot
 
-This document outlines the comprehensive testing strategy for the GitLab Issue Queue Bot, including unit tests, integration tests, and mock testing approaches.
+This document outlines the testing strategy for the Issue Queue Bot, focusing on core functionality and unit tests.
 
 ## 🧪 Test Types
 
-### 1. Unit Tests (`test_promote_next.py`)
-**Purpose**: Test individual functions and methods in isolation
+### 1. Unit Tests (`test_runner.py`)
+**Purpose**: Test individual functions and core logic
 **Coverage**:
-- Issue completion detection logic
-- File sequencing and numbering
-- Issue number extraction from titles
-- Markdown file parsing
-- API interaction patterns
+- Issue file parsing and numbering
+- Label extraction from markdown
+- Environment variable validation
+- File system operations
+- Content parsing logic
 
-**Run with**: `python -m unittest tests.test_promote_next`
+**Run with**: `python tests/test_runner.py --unit`
 
-### 2. Mock Integration Tests (`test_runner.py` + `mock_gitlab.py`)
-**Purpose**: Test full workflows without real GitLab API calls
+### 2. Label Parsing Tests (`test_label_parsing.py`)
+**Purpose**: Test label extraction and processing
 **Features**:
-- Mock GitLab server that simulates real API responses
-- Complete workflow testing (issue creation, waiting, progression)
-- Edge case testing (manual closes, unmerged MRs, empty queues)
-- Safe to run anywhere (no external dependencies)
+- Label parsing from various markdown formats
+- Edge case handling
+- Label validation and formatting
 
-**Run with**: `run-tests.bat mock` or `python tests/test_runner.py --mock`
+**Run with**: `python tests/test_runner.py --labels`
 
-### 3. Real Integration Tests (`test_integration.py`)
-**Purpose**: Test against actual GitLab API
-**Requirements**:
-- Valid GitLab Personal Access Token
-- Test GitLab project with appropriate permissions
-- ⚠️ **Creates real issues** - use dedicated test project only
+### 3. Integration Capabilities
+**Purpose**: Manual testing against live repository
+**Note**: The bot is designed to work with actual repositories. For testing, use a dedicated test repository to avoid interfering with production work.
 
-**Run with**: `run-tests.bat integration` or `python tests/test_integration.py`
-
-### 4. Pytest Tests (`test_pytest.py`)
-**Purpose**: Alternative test framework with better reporting
-**Features**:
-- Pytest-based test structure
-- Isolated test functions
-- Better test discovery and reporting
-
-**Run with**: `pytest tests/test_pytest.py`
+**Recommended approach**: Create a test repository and run the bot with test environment variables.
 
 ## 🚀 Quick Start
 
 ### Windows (Recommended)
 ```cmd
-# Run all safe tests (unit + mock)
+# Run all tests
 run-tests.bat
 
 # Run specific test types
 run-tests.bat unit
-run-tests.bat mock
-run-tests.bat integration  # Requires GitLab credentials
+run-tests.bat labels
 
 # Get help
 run-tests.bat help
@@ -64,104 +50,50 @@ run-tests.bat help
 # Install test dependencies
 pip install -r requirements.txt
 
-# Run pytest tests
-pytest tests/test_pytest.py -v
-
-# Run mock integration tests
-python tests/test_runner.py --mock
-
-# Run all safe tests
+# Run all tests
 python tests/test_runner.py --all
+
+# Run specific test suites
+python tests/test_runner.py --unit
+python tests/test_runner.py --labels
 ```
 
 ## 🎯 Test Scenarios Covered
 
 ### Core Logic Tests
-- ✅ Issue completion detection (open vs closed)
-- ✅ Manual close handling (no MR required)
-- ✅ MR-based close handling (must be merged)
-- ✅ Unmerged MR blocking (prevents progression)
-- ✅ File sequencing with gaps in numbering
-- ✅ Issue number extraction from various title formats
+- ✅ Issue file parsing and validation
+- ✅ Number extraction from filenames
+- ✅ Label parsing from markdown content
+- ✅ Environment variable validation
+- ✅ File system operations
 
-### Workflow Tests
-- ✅ First issue creation (no previous issues)
-- ✅ Waiting for incomplete issues
-- ✅ Progression after manual close
-- ✅ Progression after MR merge
-- ✅ Blocking when MR exists but not merged
-- ✅ Empty queue handling
-- ✅ API error handling
+### Content Processing Tests
+- ✅ Markdown content parsing
+- ✅ Label extraction from various formats
+- ✅ Issue title and description extraction
+- ✅ File numbering and sequencing
 
 ### Edge Cases
-- ✅ Missing numbered files
-- ✅ Malformed issue titles
-- ✅ Empty markdown files
-- ✅ Network failures
-- ✅ Permission errors
-- ✅ Concurrent access scenarios
-
-## 🛠️ Mock Server Details
-
-The `mock_gitlab.py` module provides a complete GitLab API simulation:
-
-### Supported Endpoints
-- `GET /api/v4/user` - User information
-- `GET /api/v4/projects/{id}` - Project details
-- `GET /api/v4/projects/{id}/issues` - List issues (with filtering)
-- `POST /api/v4/projects/{id}/issues` - Create issue
-- `GET /api/v4/projects/{id}/issues/{iid}` - Get specific issue
-- `PUT /api/v4/projects/{id}/issues/{iid}` - Update issue (close)
-- `GET /api/v4/projects/{id}/issues/{iid}/closed_by` - Get closing MRs
-- `GET /api/v4/projects/{id}/merge_requests/{iid}` - Get MR details
-
-### Mock State Management
-- Maintains issue and MR state across requests
-- Simulates proper state transitions
-- Supports test scenario creation
-- Automatic cleanup after tests
-
-### Usage Example
-```python
-from tests.mock_gitlab import MockGitLabServer
-
-server = MockGitLabServer(port=9999)
-server.start()
-
-# Create test scenarios
-issue_iid, mr_iid = server.create_scenario_issue_with_merged_mr()
-
-# Your tests here...
-
-server.stop()
-```
+- ✅ Missing files or directories
+- ✅ Invalid markdown formats
+- ✅ Missing environment variables
+- ✅ Empty or malformed label sections
 
 ## 📊 Test Coverage Goals
 
-| Component | Target Coverage | Status |
-|-----------|----------------|--------|
-| Issue completion logic | 100% | ✅ Complete |
-| File sequencing | 100% | ✅ Complete |
-| API interactions | 90% | ✅ Complete |
-| Error handling | 85% | ✅ Complete |
-| Edge cases | 80% | ✅ Complete |
-| Integration workflows | 95% | ✅ Complete |
+The test suite validates core functionality without requiring external API access:
+
+- **Unit Test Coverage**: Core parsing and validation logic
+- **Integration Ready**: Bot can be tested against real repositories
+- **Edge Case Handling**: Robust error handling and validation
+- **Environment Safety**: Tests use isolated temporary directories
 
 ## 🔍 Test Data
 
-### Sample Issue Files
-Test files follow the expected naming convention:
-- `001-first-issue.md`
-- `002-second-issue.md`
-- `005-fifth-issue.md` (gap testing)
-
-### Mock Scenarios
-Pre-configured test scenarios:
-- Open issue (blocks progression)
-- Closed issue with merged MR (allows progression)
-- Closed issue with unmerged MR (blocks progression)
-- Manually closed issue (allows progression)
-- Empty queue (stops processing)
+Tests use synthetic data created in temporary directories:
+- Sample markdown files with various formats
+- Test environment variables
+- Isolated file system operations
 
 ## 🐛 Debugging Tests
 
@@ -171,17 +103,11 @@ import logging
 logging.basicConfig(level=logging.DEBUG)
 ```
 
-### Mock Server Debug
-```python
-# Start mock server manually for inspection
-python tests/mock_gitlab.py
-# Server runs on http://localhost:8080
-```
-
 ### Test Environment Variables
 ```bash
-export GITLAB_TOKEN=test-token
-export PROJECT_ID=12345
+export GITHUB_TOKEN=test-token
+export REPO_OWNER=test-owner
+export REPO_NAME=test-repo
 export LABEL=test-label
 ```
 
@@ -189,14 +115,12 @@ export LABEL=test-label
 
 ### Test Execution Times
 - Unit tests: < 5 seconds
-- Mock integration tests: < 30 seconds
-- Real integration tests: 1-5 minutes (depends on GitLab API)
+- Label parsing tests: < 2 seconds
 
 ### Optimization Tips
-- Run unit tests first (fastest feedback)
-- Use mock tests for development
-- Save real integration tests for final validation
-- Parallelize independent test suites
+- Tests run in parallel when possible
+- Use temporary directories for isolation
+- Clean up resources after each test
 
 ## 🚨 Troubleshooting
 
@@ -208,45 +132,20 @@ ImportError: No module named 'promote_next'
 ```
 **Solution**: Run tests from project root directory
 
-**Mock Server Port Conflicts**
-```
-OSError: [Errno 48] Address already in use
-```
-**Solution**: Change port in test configuration or kill existing process
-
-**GitLab API Rate Limits**
-```
-HTTP 429 Too Many Requests
-```
-**Solution**: Use mock tests for development, add delays for real tests
-
 **Permission Errors**
 ```
-HTTP 403 Forbidden
+PermissionError: [Errno 13] Permission denied
 ```
-**Solution**: Check GitLab token permissions and project access
+**Solution**: Ensure write permissions in test directory
 
 ### Best Practices
 
-1. **Always run unit tests first** - fastest feedback loop
-2. **Use mock tests for development** - no external dependencies
-3. **Reserve real integration tests for CI/CD** - avoid API rate limits
-4. **Clean up test artifacts** - don't leave test issues in GitLab
-5. **Use descriptive test names** - make failures easy to understand
+1. **Always run from project root** - ensures proper imports
+2. **Use isolated test data** - tests create temporary files
+3. **Clean test environment** - tests clean up automatically
+4. **Run tests before commits** - ensure code quality
 
 ## 📈 Continuous Integration
-
-### GitLab CI/CD Integration
-```yaml
-test:
-  stage: test
-  script:
-    - pip install -r requirements.txt
-    - python tests/test_runner.py --all
-  artifacts:
-    reports:
-      junit: test-results.xml
-```
 
 ### GitHub Actions Integration
 ```yaml
@@ -256,4 +155,4 @@ test:
     python tests/test_runner.py --all
 ```
 
-This comprehensive testing strategy ensures the GitLab Issue Queue Bot works reliably across all scenarios and edge cases!
+This streamlined testing strategy focuses on core functionality while maintaining reliability and ease of use!
