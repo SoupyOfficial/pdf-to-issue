@@ -4,16 +4,16 @@ Test script to demonstrate the new debug logging for Copilot assignment.
 This shows how the assignment debugging will work without needing real credentials.
 """
 
+import logging
 import os
 import sys
-import logging
 from pathlib import Path
 
 # Add the scripts directory to Python path
 sys.path.insert(0, str(Path(__file__).parent / "scripts"))
 
 # Import the functions we want to test
-from promote_next_github import get_user_ids, COPILOT_ASSIGNEE, ASSIGNEES
+from promote_next_github import ASSIGNEES, get_user_ids
 
 # Set up logging to see debug output
 logging.basicConfig(
@@ -26,7 +26,7 @@ def test_assignment_debug():
     print("🔍 Testing Assignment Debug Logging")
     print("=" * 50)
     
-    print(f"COPILOT_ASSIGNEE from environment: '{COPILOT_ASSIGNEE}'")
+    print("Copilot assignee: 'copilot' (hardcoded)")
     print(f"ASSIGNEES from environment: {ASSIGNEES}")
     print()
     
@@ -52,14 +52,12 @@ def test_assignment_debug():
     print("Test 4: Complete assignment flow simulation")
     all_assignees = []
     
-    print(f"COPILOT_ASSIGNEE from environment: '{COPILOT_ASSIGNEE}'")
+    print("Adding 'copilot' as primary assignee (hardcoded)")
     print(f"Additional ASSIGNEES from environment: {ASSIGNEES}")
     
-    if COPILOT_ASSIGNEE:
-        all_assignees.append(COPILOT_ASSIGNEE)
-        print(f"Added Copilot assignee: '{COPILOT_ASSIGNEE}'")
-    else:
-        print("COPILOT_ASSIGNEE is empty - no Copilot will be assigned")
+    # Always add copilot as the primary assignee
+    all_assignees.append("copilot")
+    print("Added Copilot assignee: 'copilot'")
         
     all_assignees.extend(ASSIGNEES)
     print(f"All assignees before deduplication: {all_assignees}")

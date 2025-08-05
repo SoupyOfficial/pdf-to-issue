@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """
-Issue Queue Bot - Promotes one issue at a time
-==============================================
+GitHub Issue Queue Bot - Promotes one issue at a time
+====================================================
 
-Promotes numbered Markdown files from issues/ directory to repository issues,
+Promotes numbered Markdown files from issues/ directory to GitHub issues,
 but only after the previous issue has been closed by a merged PR.
 
 Environment Variables Required:
 - GITHUB_TOKEN: Personal Access Token with 'repo' scope
-- REPO_OWNER: Repository owner (username or organization)
-- REPO_NAME: Repository name
+- REPO_OWNER: GitHub repository owner (username or organization)
+- REPO_NAME: GitHub repository name
 
 Optional Environment Variables:
-- GITHUB_URL: API instance URL (default: https://api.github.com)
+- GITHUB_URL: GitHub instance URL (default: https://api.github.com)
 - LABEL: Bot tracking label to identify bot-created issues (default: auto-generated)
-- ASSIGNEES: Additional comma-separated usernames to assign (default: none)
+- ASSIGNEES: Additional comma-separated GitHub usernames to assign (default: none)
 - POLL_INTERVAL: Sleep interval in seconds for continuous mode (default: 900 = 15min)
 
 Note: The bot will also read and apply labels from each issue's "## Labels" section,
 creating any labels that don't exist in the repository.
 
 Workflow:
-1. Creates issue and assigns to copilot
+1. Creates issue and assigns to Copilot
 2. Monitors for associated pull request from Copilot
 3. Waits for Copilot to request review
 4. Auto-approves and merges the pull request
