@@ -726,6 +726,9 @@ def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
             # Check the status of the most recent linked PR
             latest_pr = linked_prs[0]  # Already sorted by creation time
             pr_state = latest_pr["state"]
+            pr_number = latest_pr["number"]
+            
+            logger.debug(f"Found linked PR #{pr_number} in state: {pr_state}")
             
             if pr_state == "closed":
                 if latest_pr.get("merged"):
@@ -740,20 +743,56 @@ def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
                     logger.debug(f"Copilot PR #{latest_pr['number']} is still in draft")
                     return "copilot_working"
                 
-                # Check review requests
+                # Check review requests and PR status indicators
                 try:
                     pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{latest_pr['number']}")
                     requested_reviewers = pr_details.get("requested_reviewers", [])
+                    requested_teams = pr_details.get("requested_teams", [])
                     
-                    if requested_reviewers:
-                        logger.info(f"Copilot PR #{latest_pr['number']} is ready for review")
+                    # Check for review requests (users or teams)
+                    has_review_requests = len(requested_reviewers) > 0 or len(requested_teams) > 0
+                    
+                    # Check if PR title/body indicates it's ready for review
+                    pr_title = pr_details.get("title", "").lower()
+                    pr_body = pr_details.get("body", "") or ""
+                    pr_body_lower = pr_body.lower()
+                    
+                    # Look for indicators that Copilot is ready for review
+                    ready_indicators = [
+                        "ready for review" in pr_title,
+                        "ready for review" in pr_body_lower,
+                        "[ready]" in pr_title,
+                        "[ready]" in pr_body_lower,
+                        "please review" in pr_body_lower,
+                        not pr_details.get("draft", False)  # Non-draft PR is generally ready
+                    ]
+                    
+                    # Also check if the PR has been marked as ready by removing WIP/draft status
+                    wip_removed = not ("[wip]" in pr_title or "wip:" in pr_title)
+                    
+                    if has_review_requests:
+                        logger.info(f"✅ Copilot PR #{latest_pr['number']} has explicit review requests: {len(requested_reviewers)} reviewers, {len(requested_teams)} teams")
+                        return "pr_ready_for_review"
+                    elif any(ready_indicators) and wip_removed:
+                        logger.info(f"✅ Copilot PR #{latest_pr['number']} appears ready for review (non-draft, no WIP markers)")
                         return "pr_ready_for_review"
                     else:
+                        logger.debug(f"🔄 Copilot PR #{latest_pr['number']} is still in progress (draft={pr_details.get('draft', False)}, title='{pr_title}')")
                         return "copilot_working"
                 
                 except Exception as e:
                     logger.warning(f"Could not check PR review status: {e}")
-                    return "copilot_working"
+                    # Fallback: if it's not a draft and not explicitly WIP, assume it's ready
+                    pr_title = latest_pr.get("title", "").lower()
+                    is_draft = latest_pr.get("draft", False)
+                    is_wip = "[wip]" in pr_title or "wip:" in pr_title
+                    
+                    if not is_draft and not is_wip:
+                        logger.info(f"✅ Copilot PR #{latest_pr['number']} assumed ready (fallback: non-draft, non-WIP)")
+                        return "pr_ready_for_review"
+                    else:
+                        logger.debug(f"🔄 Copilot PR #{latest_pr['number']} assumed working (fallback: draft={is_draft}, wip={is_wip})")
+                        return "copilot_working"
         
         elif copilot_started and not copilot_finished:
             return "copilot_working"
