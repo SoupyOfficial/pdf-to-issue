@@ -668,9 +668,326 @@ def find_related_prs_for_issue(issue: Dict[str, Any]) -> List[Dict[str, Any]]:
     
     return linked_prs
 
+def wait_for_pr_readiness(pr_number: int, max_wait_minutes: int = 10, check_interval_seconds: int = 30) -> bool:
+    """
+    Wait for a PR to become ready to merge, checking periodically.
+    Useful for waiting for status checks to complete.
+    """
+    import time
+    max_attempts = (max_wait_minutes * 60) // check_interval_seconds
+    attempt = 0
+    
+    logger.info(f"⏳ Waiting up to {max_wait_minutes} minutes for PR #{pr_number} to become ready...")
+    
+    while attempt < max_attempts:
+        try:
+            pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+            is_ready, reason = is_pr_ready_to_merge(pr_details)
+            
+            if is_ready:
+                logger.info(f"✅ PR #{pr_number} is now ready: {reason}")
+                return True
+            
+            # Log the current blocking reason
+            logger.debug(f"PR #{pr_number} not ready yet (attempt {attempt + 1}/{max_attempts}): {reason}")
+            
+            # Check if it's worth waiting (not permanently blocked)
+            if "conflicts" in reason.lower() or "closed" in reason.lower():
+                logger.warning(f"PR #{pr_number} appears permanently blocked: {reason}")
+                return False
+            
+            time.sleep(check_interval_seconds)
+            attempt += 1
+            
+        except Exception as e:
+            logger.warning(f"Error checking PR #{pr_number} readiness: {e}")
+            time.sleep(check_interval_seconds)
+            attempt += 1
+    
+    logger.warning(f"⏰ Timeout waiting for PR #{pr_number} to become ready after {max_wait_minutes} minutes")
+    return False
+
+def retry_operation(func, *args, max_retries: int = 3, delay: int = 5, **kwargs):
+    """
+    Retry an operation with exponential backoff.
+    Useful for handling transient API errors.
+    """
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise e
+            
+            wait_time = delay * (2 ** attempt)
+            logger.warning(f"Operation failed (attempt {attempt + 1}/{max_retries}): {e}")
+            logger.info(f"Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+def get_comprehensive_pr_status(pr_number: int) -> Dict[str, Any]:
+    """Get comprehensive status information about a pull request."""
+    try:
+        # Get basic PR details
+        pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+        
+        # Get reviews
+        reviews = get_pr_reviews(pr_number)
+        
+        # Get status checks
+        status_info = get_pr_status_checks(pr_number)
+        
+        # Process reviews to get latest state from each reviewer
+        review_summary = {}
+        latest_reviews = {}
+        
+        for review in reviews:
+            reviewer_login = review["user"]["login"]
+            review_state = review["state"]
+            submitted_at = review["submitted_at"]
+            
+            if reviewer_login not in latest_reviews or submitted_at > latest_reviews[reviewer_login]["submitted_at"]:
+                latest_reviews[reviewer_login] = review
+                review_summary[reviewer_login] = {
+                    "state": review_state,
+                    "submitted_at": submitted_at,
+                    "body": review.get("body", "")[:200] + "..." if len(review.get("body", "")) > 200 else review.get("body", "")
+                }
+        
+        # Count review states
+        approved_count = sum(1 for r in review_summary.values() if r["state"] == "APPROVED")
+        changes_requested_count = sum(1 for r in review_summary.values() if r["state"] == "CHANGES_REQUESTED")
+        pending_count = sum(1 for r in review_summary.values() if r["state"] == "PENDING")
+        
+        # Check merge readiness
+        is_ready, ready_reason = is_pr_ready_to_merge(pr_details)
+        
+        # Summarize status checks
+        status_summary = "unknown"
+        check_details = []
+        
+        if status_info["status"]:
+            status_summary = status_info["status"].get("state", "unknown")
+            statuses = status_info["status"].get("statuses", [])
+            for status in statuses:
+                check_details.append({
+                    "context": status.get("context", "unknown"),
+                    "state": status.get("state", "unknown"),
+                    "description": status.get("description", "")
+                })
+        
+        if status_info["check_runs"]:
+            check_runs = status_info["check_runs"].get("check_runs", [])
+            for check_run in check_runs:
+                check_details.append({
+                    "context": check_run.get("name", "unknown"),
+                    "state": check_run.get("conclusion") or check_run.get("status", "unknown"),
+                    "description": check_run.get("output", {}).get("summary", "")[:100]
+                })
+        
+        return {
+            "pr_number": pr_number,
+            "title": pr_details.get("title", ""),
+            "state": pr_details.get("state", ""),
+            "draft": pr_details.get("draft", False),
+            "mergeable": pr_details.get("mergeable"),
+            "mergeable_state": pr_details.get("mergeable_state"),
+            "author": pr_details.get("user", {}).get("login", "unknown"),
+            "created_at": pr_details.get("created_at", ""),
+            "updated_at": pr_details.get("updated_at", ""),
+            "review_summary": {
+                "approved": approved_count,
+                "changes_requested": changes_requested_count,
+                "pending": pending_count,
+                "reviewers": review_summary
+            },
+            "status_checks": {
+                "overall_state": status_summary,
+                "checks": check_details
+            },
+            "requested_reviewers": [r.get("login", "") for r in pr_details.get("requested_reviewers", [])],
+            "requested_teams": [t.get("name", "") for t in pr_details.get("requested_teams", [])],
+            "is_ready_to_merge": is_ready,
+            "ready_reason": ready_reason,
+            "html_url": pr_details.get("html_url", "")
+        }
+    
+    except Exception as e:
+        logger.error(f"Could not get comprehensive PR status for #{pr_number}: {e}")
+        return {"pr_number": pr_number, "error": str(e)}
+
+def log_pr_monitoring_details(issue: Dict[str, Any]):
+    """Log detailed monitoring information for an issue's related PRs."""
+    issue_number = issue["number"]
+    logger.info(f"📊 Detailed monitoring for issue #{issue_number}")
+    
+    # Find related PRs
+    related_prs = find_related_prs_for_issue(issue)
+    
+    if not related_prs:
+        logger.info(f"   No related PRs found for issue #{issue_number}")
+        return
+    
+    for i, pr in enumerate(related_prs):
+        pr_number = pr["number"]
+        logger.info(f"   PR #{pr_number} ({pr['state']}) - {pr.get('title', 'No title')[:80]}")
+        
+        if pr["state"] == "open":
+            # Get comprehensive status for open PRs
+            status = get_comprehensive_pr_status(pr_number)
+            
+            if "error" in status:
+                logger.error(f"     ❌ Error getting status: {status['error']}")
+                continue
+            
+            logger.info(f"     📋 Draft: {status['draft']}, Mergeable: {status['mergeable']}")
+            logger.info(f"     🔍 Reviews: ✅{status['review_summary']['approved']} "
+                       f"❌{status['review_summary']['changes_requested']} "
+                       f"⏳{status['review_summary']['pending']}")
+            
+            if status['requested_reviewers']:
+                logger.info(f"     👥 Pending reviewers: {', '.join(status['requested_reviewers'])}")
+            
+            logger.info(f"     🚦 Status: {status['status_checks']['overall_state']}")
+            
+            for check in status['status_checks']['checks'][:3]:  # Show first 3 checks
+                logger.info(f"       - {check['context']}: {check['state']}")
+            
+            if len(status['status_checks']['checks']) > 3:
+                logger.info(f"       ... and {len(status['status_checks']['checks']) - 3} more checks")
+            
+            logger.info(f"     🎯 Ready to merge: {status['is_ready_to_merge']} - {status['ready_reason']}")
+        
+        elif pr["state"] == "closed":
+            merged = pr.get("merged", False)
+            logger.info(f"     ✅ Closed - {'Merged' if merged else 'Not merged'}")
+
+def get_pr_reviews(pr_number: int) -> List[Dict[str, Any]]:
+    """Get all reviews for a pull request."""
+    try:
+        reviews = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/reviews")
+        return reviews or []
+    except Exception as e:
+        logger.warning(f"Could not get reviews for PR #{pr_number}: {e}")
+        return []
+
+def get_pr_status_checks(pr_number: int) -> Dict[str, Any]:
+    """Get status checks for a pull request."""
+    try:
+        # Get the PR details to get the head SHA
+        pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+        head_sha = pr_details["head"]["sha"]
+        
+        # Get status checks for the head commit
+        status_checks = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{head_sha}/status")
+        
+        # Also get check runs (newer format)
+        check_runs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/commits/{head_sha}/check-runs")
+        
+        return {
+            "status": status_checks,
+            "check_runs": check_runs,
+            "head_sha": head_sha
+        }
+    except Exception as e:
+        logger.warning(f"Could not get status checks for PR #{pr_number}: {e}")
+        return {"status": None, "check_runs": None, "head_sha": None}
+
+def is_pr_ready_to_merge(pr_details: Dict[str, Any]) -> tuple[bool, str]:
+    """
+    Check if a PR is ready to be merged based on comprehensive criteria.
+    Returns (is_ready, reason).
+    """
+    pr_number = pr_details["number"]
+    
+    # Check if PR is mergeable
+    if pr_details.get("mergeable_state") == "blocked":
+        return False, "PR is blocked (mergeable_state: blocked)"
+    
+    if not pr_details.get("mergeable", True):
+        return False, "PR is not mergeable (conflicts or other issues)"
+    
+    # Check if PR is in draft
+    if pr_details.get("draft", False):
+        return False, "PR is still in draft mode"
+    
+    # Check for WIP indicators
+    pr_title = pr_details.get("title", "").lower()
+    if "[wip]" in pr_title or "wip:" in pr_title or "work in progress" in pr_title:
+        return False, "PR has WIP (Work in Progress) indicators"
+    
+    # Get reviews
+    reviews = get_pr_reviews(pr_number)
+    
+    # Check review status
+    review_states = {}
+    latest_reviews = {}
+    
+    # Process reviews to get latest state from each reviewer
+    for review in reviews:
+        reviewer_login = review["user"]["login"]
+        review_state = review["state"]
+        submitted_at = review["submitted_at"]
+        
+        if reviewer_login not in latest_reviews or submitted_at > latest_reviews[reviewer_login]["submitted_at"]:
+            latest_reviews[reviewer_login] = review
+            review_states[reviewer_login] = review_state
+    
+    # Count review states
+    approved_count = sum(1 for state in review_states.values() if state == "APPROVED")
+    changes_requested_count = sum(1 for state in review_states.values() if state == "CHANGES_REQUESTED")
+    
+    if changes_requested_count > 0:
+        return False, f"PR has {changes_requested_count} reviews requesting changes"
+    
+    # Check if review is required (look for requested reviewers)
+    requested_reviewers = pr_details.get("requested_reviewers", [])
+    requested_teams = pr_details.get("requested_teams", [])
+    
+    has_pending_reviews = len(requested_reviewers) > 0 or len(requested_teams) > 0
+    
+    # For bot PRs, we'll be more lenient with review requirements
+    pr_author = pr_details.get("user", {}).get("login", "")
+    is_bot_pr = pr_author == "copilot-swe-agent"
+    
+    if is_bot_pr:
+        # For bot PRs, we need at least some indication it's ready
+        if approved_count == 0 and has_pending_reviews:
+            return False, f"Copilot PR has pending review requests ({len(requested_reviewers)} reviewers, {len(requested_teams)} teams)"
+        
+        # Check status checks
+        status_info = get_pr_status_checks(pr_number)
+        if status_info["status"]:
+            overall_state = status_info["status"].get("state", "pending")
+            if overall_state in ["failure", "error"]:
+                return False, f"PR has failing status checks (state: {overall_state})"
+            elif overall_state == "pending":
+                return False, "PR has pending status checks"
+        
+        # Check check runs (GitHub Actions, etc.)
+        if status_info["check_runs"]:
+            check_runs = status_info["check_runs"].get("check_runs", [])
+            for check_run in check_runs:
+                status = check_run.get("status")
+                conclusion = check_run.get("conclusion")
+                
+                if status == "in_progress":
+                    return False, f"PR has in-progress check: {check_run.get('name', 'unknown')}"
+                elif conclusion in ["failure", "cancelled", "timed_out"]:
+                    return False, f"PR has failed check: {check_run.get('name', 'unknown')} ({conclusion})"
+        
+        return True, "Copilot PR is ready to merge"
+    
+    # For non-bot PRs, stricter requirements
+    if approved_count == 0:
+        return False, "PR needs at least one approval"
+    
+    return True, f"PR is ready to merge ({approved_count} approvals)"
+
 def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
     """
-    Check the current status of the Copilot workflow for an issue.
+    Enhanced check of the current status of the Copilot workflow for an issue.
     Returns: 'waiting_for_copilot', 'copilot_working', 'pr_ready_for_review', 'completed'
     """
     issue_number = issue["number"]
@@ -738,61 +1055,29 @@ def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
                     return "completed"  # Consider it done
             
             elif pr_state == "open":
-                # Check if PR is ready for review
-                if latest_pr.get("draft"):
-                    logger.debug(f"Copilot PR #{latest_pr['number']} is still in draft")
-                    return "copilot_working"
-                
-                # Check review requests and PR status indicators
+                # Get detailed PR information
                 try:
-                    pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{latest_pr['number']}")
-                    requested_reviewers = pr_details.get("requested_reviewers", [])
-                    requested_teams = pr_details.get("requested_teams", [])
+                    pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
                     
-                    # Check for review requests (users or teams)
-                    has_review_requests = len(requested_reviewers) > 0 or len(requested_teams) > 0
+                    # Use comprehensive readiness check
+                    is_ready, reason = is_pr_ready_to_merge(pr_details)
                     
-                    # Check if PR title/body indicates it's ready for review
-                    pr_title = pr_details.get("title", "").lower()
-                    pr_body = pr_details.get("body", "") or ""
-                    pr_body_lower = pr_body.lower()
-                    
-                    # Look for indicators that Copilot is ready for review
-                    ready_indicators = [
-                        "ready for review" in pr_title,
-                        "ready for review" in pr_body_lower,
-                        "[ready]" in pr_title,
-                        "[ready]" in pr_body_lower,
-                        "please review" in pr_body_lower,
-                        not pr_details.get("draft", False)  # Non-draft PR is generally ready
-                    ]
-                    
-                    # Also check if the PR has been marked as ready by removing WIP/draft status
-                    wip_removed = not ("[wip]" in pr_title or "wip:" in pr_title)
-                    
-                    if has_review_requests:
-                        logger.info(f"✅ Copilot PR #{latest_pr['number']} has explicit review requests: {len(requested_reviewers)} reviewers, {len(requested_teams)} teams")
-                        return "pr_ready_for_review"
-                    elif any(ready_indicators) and wip_removed:
-                        logger.info(f"✅ Copilot PR #{latest_pr['number']} appears ready for review (non-draft, no WIP markers)")
+                    if is_ready:
+                        logger.info(f"✅ Copilot PR #{pr_number} is ready for merge: {reason}")
                         return "pr_ready_for_review"
                     else:
-                        logger.debug(f"🔄 Copilot PR #{latest_pr['number']} is still in progress (draft={pr_details.get('draft', False)}, title='{pr_title}')")
+                        logger.debug(f"🔄 Copilot PR #{pr_number} is not ready: {reason}")
                         return "copilot_working"
-                
+                        
                 except Exception as e:
-                    logger.warning(f"Could not check PR review status: {e}")
-                    # Fallback: if it's not a draft and not explicitly WIP, assume it's ready
-                    pr_title = latest_pr.get("title", "").lower()
-                    is_draft = latest_pr.get("draft", False)
-                    is_wip = "[wip]" in pr_title or "wip:" in pr_title
-                    
-                    if not is_draft and not is_wip:
-                        logger.info(f"✅ Copilot PR #{latest_pr['number']} assumed ready (fallback: non-draft, non-WIP)")
-                        return "pr_ready_for_review"
-                    else:
-                        logger.debug(f"🔄 Copilot PR #{latest_pr['number']} assumed working (fallback: draft={is_draft}, wip={is_wip})")
+                    logger.warning(f"Could not check detailed PR status: {e}")
+                    # Fallback to basic checks
+                    if latest_pr.get("draft", False):
+                        logger.debug(f"Copilot PR #{pr_number} is still in draft (fallback)")
                         return "copilot_working"
+                    else:
+                        logger.info(f"✅ Copilot PR #{pr_number} assumed ready (fallback: non-draft)")
+                        return "pr_ready_for_review"
         
         elif copilot_started and not copilot_finished:
             return "copilot_working"
@@ -812,7 +1097,7 @@ def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
             return "waiting_for_copilot"
 
 def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
-    """Auto-approve and merge the PR associated with an issue."""
+    """Enhanced auto-approve and merge the PR associated with an issue."""
     issue_number = issue["number"]
     
     # Use improved PR finding to locate the related PR
@@ -832,20 +1117,61 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
     pr_number = related_pr["number"]
     
     try:
-        # 1. Approve the PR
-        review_data = {
-            "body": "Auto-approved by GitHub Issue Queue Bot - Copilot implementation completed.",
-            "event": "APPROVE"
-        }
+        # Get detailed PR information
+        pr_details = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
         
-        logger.info(f"Auto-approving Copilot PR #{pr_number}")
-        api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/reviews", 
-                   method="POST", json=review_data)
+        # Double-check if PR is ready to merge
+        is_ready, reason = is_pr_ready_to_merge(pr_details)
+        if not is_ready:
+            logger.warning(f"PR #{pr_number} is not ready to merge: {reason}")
+            return False
         
-        # 2. Merge the PR using the updated API format
+        logger.info(f"PR #{pr_number} is ready to merge: {reason}")
+        
+        # Check if PR already has approving reviews from us
+        existing_reviews = get_pr_reviews(pr_number)
+        bot_review = None
+        
+        for review in existing_reviews:
+            reviewer = review.get("user", {}).get("login", "")
+            # Check if we've already reviewed this PR
+            # Note: This might need adjustment based on the actual bot user
+            if reviewer in ["github-actions[bot]", "dependabot[bot]"] or "bot" in reviewer.lower():
+                bot_review = review
+                break
+        
+        # 1. Create or update approval review
+        if bot_review and bot_review["state"] == "APPROVED":
+            logger.info(f"PR #{pr_number} already has bot approval review")
+        else:
+            review_data = {
+                "body": "Auto-approved by GitHub Issue Queue Bot - Copilot implementation completed.\n\nThis PR has been automatically reviewed and meets the following criteria:\n- ✅ All status checks passed\n- ✅ No conflicts detected\n- ✅ Copilot implementation complete\n- ✅ No WIP indicators found",
+                "event": "APPROVE"
+            }
+            
+            logger.info(f"Auto-approving Copilot PR #{pr_number}")
+            approval_result = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}/reviews", 
+                           method="POST", json=review_data)
+            
+            if approval_result:
+                logger.info(f"✅ Created approval review #{approval_result.get('id', 'unknown')}")
+        
+        # Small delay to ensure review is processed
+        import time
+        time.sleep(2)
+        
+        # 2. Double-check merge readiness after approval
+        updated_pr = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+        is_still_ready, updated_reason = is_pr_ready_to_merge(updated_pr)
+        
+        if not is_still_ready:
+            logger.error(f"PR #{pr_number} became not ready after approval: {updated_reason}")
+            return False
+        
+        # 3. Merge the PR using the updated API format
         merge_data = {
             "commit_title": f"Merge PR #{pr_number}: {related_pr['title']}",
-            "commit_message": f"Resolves #{issue_number}\n\nAuto-merged by GitHub Issue Queue Bot after Copilot completion.",
+            "commit_message": f"Resolves #{issue_number}\n\nAuto-merged by GitHub Issue Queue Bot after Copilot completion.\n\nCopilot has successfully implemented the requested feature/fix.\nAll automated checks have passed.",
             "merge_method": "squash"  # Use squash merge for cleaner history
         }
         
@@ -854,13 +1180,25 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
                                  method="PUT", json=merge_data)
         
         if merge_result:
-            logger.info(f"✅ Successfully merged Copilot PR #{pr_number}: {merge_result.get('message', 'Success')}")
+            merge_sha = merge_result.get("sha", "unknown")
+            logger.info(f"✅ Successfully merged Copilot PR #{pr_number}: {merge_result.get('message', 'Success')} (SHA: {merge_sha})")
         else:
             logger.info(f"✅ Successfully merged Copilot PR #{pr_number}")
+        
         return True
         
     except Exception as e:
         logger.error(f"Failed to auto-approve/merge Copilot PR #{pr_number}: {e}")
+        
+        # Log additional context for debugging
+        try:
+            error_pr = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls/{pr_number}")
+            logger.debug(f"PR state at error: mergeable={error_pr.get('mergeable')}, "
+                        f"mergeable_state={error_pr.get('mergeable_state')}, "
+                        f"draft={error_pr.get('draft')}")
+        except:
+            pass
+        
         return False
 
 def get_next_file(after_issue_number: Optional[int] = None) -> Optional[pathlib.Path]:
@@ -1301,10 +1639,14 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
         
         elif workflow_status == "copilot_working":
             logger.info("Copilot is actively working on the issue...")
+            # Log detailed monitoring information
+            log_pr_monitoring_details(last_issue)
             return False
         
         elif workflow_status == "pr_ready_for_review":
             logger.info("Pull request is ready for review - auto-approving and merging...")
+            # Log detailed status before attempting merge
+            log_pr_monitoring_details(last_issue)
             success = auto_approve_and_merge_pr(last_issue)
             if success:
                 logger.info("Pull request merged successfully - workflow advancing")
@@ -1395,9 +1737,9 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
         return False
 
 def show_status():
-    """Show current status of processed files."""
-    logger.info("📊 Current Status Report")
-    logger.info("=" * 50)
+    """Enhanced status report with detailed PR monitoring."""
+    logger.info("📊 Enhanced Status Report")
+    logger.info("=" * 60)
     
     # Sync with GitHub first
     state = sync_processed_files_with_github()
@@ -1431,18 +1773,47 @@ def show_status():
     logger.info(f"✅ Completed files: {len(completed)}")
     logger.info(f"🔄 Currently processing: {len(processing)}")
     logger.info(f"⏳ Remaining files: {len(all_files) - len(completed) - len(processing)}")
+    logger.info("")
     
+    # Show currently processing files with detailed status
     if processing:
-        logger.info("\n🔄 Currently Processing:")
+        logger.info("🔄 Currently Processing Files (Detailed):")
         for file_entry in processing:
-            logger.info(f"  - {file_entry.get('filename')} (Issue #{file_entry.get('issue_number')})")
+            filename = file_entry.get("filename", "unknown")
+            issue_number = file_entry.get("issue_number", "unknown")
+            created_at = file_entry.get("created_at", "unknown")
+            
+            logger.info(f"   📄 {filename}")
+            logger.info(f"      GitHub Issue: #{issue_number}")
+            logger.info(f"      Created: {created_at}")
+            
+            # Get the actual issue from GitHub to show current status
+            try:
+                issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{issue_number}")
+                workflow_status = check_copilot_workflow_status(issue)
+                logger.info(f"      Workflow Status: {workflow_status}")
+                
+                # Show detailed PR information
+                log_pr_monitoring_details(issue)
+                
+            except Exception as e:
+                logger.warning(f"      ⚠️ Could not get issue status: {e}")
+            
+            logger.info("")
     
+    # Show recently completed files
     if completed:
-        logger.info(f"\n✅ Last 5 Completed Files:")
-        # Sort by completion time or file number
-        recent_completed = sorted(completed, key=lambda f: f.get("completed_at", ""), reverse=True)[:5]
+        logger.info("✅ Recently Completed Files (last 5):")
+        recent_completed = sorted(completed, 
+                                key=lambda f: f.get("completed_at", ""), 
+                                reverse=True)[:5]
+        
         for file_entry in recent_completed:
-            logger.info(f"  - {file_entry.get('filename')} (Issue #{file_entry.get('issue_number')})")
+            filename = file_entry.get("filename", "unknown")
+            issue_number = file_entry.get("issue_number", "unknown")
+            completed_at = file_entry.get("completed_at", "unknown")
+            logger.info(f"   ✅ {filename} (Issue #{issue_number}) - Completed: {completed_at}")
+        logger.info("")
     
     # Show next file to process
     next_file = None
@@ -1456,11 +1827,11 @@ def show_status():
         logger.warning(f"Could not determine next file: {e}")
     
     if next_file:
-        logger.info(f"\n⏭️  Next file to process: {next_file}")
+        logger.info(f"⏭️  Next file to process: {next_file}")
     else:
-        logger.info(f"\n🎉 All files have been processed!")
+        logger.info(f"🎉 All files have been processed!")
     
-    logger.info("=" * 50)
+    logger.info("=" * 60)
 
 def resume_bot_state(copilot_info: Dict[str, Any]) -> Dict[str, Any]:
     """
