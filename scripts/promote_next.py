@@ -6,6 +6,18 @@ Issue Queue Bot - Promotes one issue at a time
 Promotes numbered Markdown files from issues/ directory to repository issues,
 but only after the previous issue has been closed by a merged PR.
 
+NEW: Enhanced mismatch handling between local file numbers and GitHub issue numbers.
+The bot now maintains its own state file to track which files have been processed,
+regardless of the GitHub issue numbers they receive. This handles cases where 
+repositories already have existing issues/PRs.
+
+ENHANCED: Smart resume capability for bot restarts.
+The bot automatically resumes from where it left off by:
+1. Syncing local state with GitHub repository on startup
+2. Identifying active bot issues and their current workflow state  
+3. Determining the appropriate next action (monitor, review, merge, or create new)
+4. Continuing seamlessly without manual intervention
+
 Environment Variables Required:
 - GITHUB_TOKEN: Personal Access Token with 'repo' scope
 - REPO_OWNER: Repository owner (username or organization)
@@ -22,10 +34,49 @@ creating any labels that don't exist in the repository.
 
 Workflow:
 1. Creates issue and assigns to copilot
-2. Monitors for associated pull request from Copilot
+2. Monitors for associated pull request from Copilot using multiple strategies:
+   - Direct issue number references (#123)
+   - Time-based correlation (PRs created after issue)
+   - [WIP] markers in PR titles
+   - File number references in PR content
 3. Waits for Copilot to request review
 4. Auto-approves and merges the pull request
 5. Only then creates the next issue in sequence
+
+Command Line Options:
+- --continuous or --daemon: Run in continuous monitoring mode
+- --status: Show current processing status and sync state with GitHub
+- --resume or --sync: Force a complete state sync with GitHub and show resume plan
+- --help: Show this help message
+
+State Management:
+The bot maintains a state file (logs/processed_files.json) to track:
+- Which files have been processed
+- Current processing status
+- GitHub issue numbers for correlation
+- Completion timestamps
+- Resume context for bot restarts
+
+Resume Support:
+On startup, the bot automatically:
+1. Syncs local state with GitHub repository
+2. Identifies any active bot issues and their current workflow state
+3. Determines the appropriate next action (monitor, review, merge, or create new)
+4. Continues seamlessly from where it left off
+
+Resume Workflow (on bot restart):
+1. Sync local state with GitHub repository
+2. Identify any open bot issues and their workflow state
+3. If active issue found:
+   - waiting_for_copilot: Monitor for Copilot to start
+   - copilot_working: Monitor for PR creation  
+   - pr_ready_for_review: Auto-approve and merge
+   - completed: Mark as done and create next issue
+4. If no active issues: Create next unprocessed issue
+5. Continue normal workflow monitoring
+
+This ensures reliable operation even when GitHub issue numbers don't match
+local file numbering due to existing repository history.
 """
 
 import hashlib
@@ -52,6 +103,7 @@ POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "900"))  # 15 minutes
 # Paths
 ISSUES_DIR = pathlib.Path("issues")
 LOG_DIR = pathlib.Path("logs")
+STATE_FILE = LOG_DIR / "processed_files.json"
 
 # Setup logging
 LOG_DIR.mkdir(exist_ok=True)
@@ -235,6 +287,219 @@ def graphql_request(query: str, variables: Optional[Dict[str, Any]] = None) -> A
                 logger.error(f"GraphQL error response: {e.response.text}")
         raise
 
+def load_processed_files_state() -> Dict[str, Any]:
+    """Load the state of processed files from disk."""
+    try:
+        if STATE_FILE.exists():
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {"processed_files": [], "last_completed_file": None}
+    except Exception as e:
+        logger.warning(f"Could not load processed files state: {e}")
+        return {"processed_files": [], "last_completed_file": None}
+
+def save_processed_files_state(state: Dict[str, Any]):
+    """Save the state of processed files to disk."""
+    try:
+        STATE_FILE.parent.mkdir(exist_ok=True)
+        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2)
+        logger.debug(f"Saved processed files state: {len(state.get('processed_files', []))} files tracked")
+    except Exception as e:
+        logger.warning(f"Could not save processed files state: {e}")
+
+def mark_file_as_processing(filename: str, issue_number: int) -> Dict[str, Any]:
+    """Mark a file as currently being processed."""
+    state = load_processed_files_state()
+    
+    # Add or update the file entry
+    processed_files = state.get("processed_files", [])
+    
+    # Remove any existing entry for this file
+    processed_files = [f for f in processed_files if f.get("filename") != filename]
+    
+    # Add new entry
+    file_entry = {
+        "filename": filename,
+        "issue_number": issue_number,
+        "status": "processing",
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    }
+    processed_files.append(file_entry)
+    
+    state["processed_files"] = processed_files
+    save_processed_files_state(state)
+    
+    return file_entry
+
+def mark_file_as_completed(filename: str):
+    """Mark a file as completed."""
+    state = load_processed_files_state()
+    processed_files = state.get("processed_files", [])
+    
+    # Find and update the file entry
+    for file_entry in processed_files:
+        if file_entry.get("filename") == filename:
+            file_entry["status"] = "completed"
+            file_entry["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            break
+    
+    state["last_completed_file"] = filename
+    save_processed_files_state(state)
+
+def sync_processed_files_with_github() -> Dict[str, Any]:
+    """
+    Sync our local state with what's actually on GitHub.
+    This helps recover if files were processed outside of this system.
+    Enhanced with better error handling and progress feedback.
+    """
+    logger.info("🔄 Syncing processed files state with GitHub...")
+    
+    try:
+        # Get all bot issues from GitHub
+        params = {
+            "labels": LABEL,
+            "state": "all",
+            "sort": "created",
+            "direction": "asc",  # Oldest first
+            "per_page": 100
+        }
+        
+        issues = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", params=params)
+        logger.info(f"📊 Found {len(issues)} bot issues in GitHub repository")
+        
+        # Load current state
+        state = load_processed_files_state()
+        processed_files = state.get("processed_files", [])
+        
+        # Create a map of existing entries
+        existing_files = {f.get("filename"): f for f in processed_files}
+        
+        updated_count = 0
+        added_count = 0
+        
+        # Check each GitHub issue
+        for i, issue in enumerate(issues):
+            if i % 10 == 0 and i > 0:
+                logger.debug(f"Processing issue {i+1}/{len(issues)}...")
+                
+            file_number = extract_issue_number_from_title(issue["title"])
+            if file_number is None:
+                logger.debug(f"Could not extract file number from issue title: {issue['title']}")
+                continue
+            
+            # Find corresponding file
+            pattern = f"{file_number:03d}-*.md"
+            matching_files = list(ISSUES_DIR.glob(pattern)) if ISSUES_DIR.exists() else []
+            if not matching_files:
+                logger.debug(f"No local file found for issue #{issue['number']} (pattern: {pattern})")
+                continue
+            
+            filename = matching_files[0].name
+            
+            # Determine if this issue is completed
+            is_completed = is_issue_done(issue)
+            status = "completed" if is_completed else "processing"
+            
+            # Update or create entry
+            if filename in existing_files:
+                # Update existing entry
+                entry = existing_files[filename]
+                old_status = entry.get("status")
+                if old_status != status or entry.get("issue_number") != issue["number"]:
+                    logger.info(f"📝 Updating {filename}: status={old_status}->{status}, issue=#{entry.get('issue_number', 'none')}->{issue['number']}")
+                    entry["status"] = status
+                    entry["issue_number"] = issue["number"]
+                    if status == "completed" and "completed_at" not in entry:
+                        entry["completed_at"] = issue.get("closed_at", time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                    updated_count += 1
+            else:
+                # Create new entry
+                logger.info(f"➕ Adding missing file to state: {filename} (issue #{issue['number']}, status: {status})")
+                new_entry = {
+                    "filename": filename,
+                    "issue_number": issue["number"],
+                    "status": status,
+                    "created_at": issue["created_at"]
+                }
+                if status == "completed":
+                    new_entry["completed_at"] = issue.get("closed_at", time.strftime("%Y-%m-%dT%H:%M:%SZ"))
+                
+                processed_files.append(new_entry)
+                existing_files[filename] = new_entry
+                added_count += 1
+        
+        # Update state and save
+        state["processed_files"] = processed_files
+        
+        # Update last completed file
+        completed_files = [f for f in processed_files if f.get("status") == "completed"]
+        if completed_files:
+            # Sort by file number to find the actual last completed file
+            completed_files.sort(key=lambda f: extract_issue_number_from_title(f.get("filename", "")) or 0)
+            state["last_completed_file"] = completed_files[-1]["filename"]
+        
+        save_processed_files_state(state)
+        
+        completed_count = len([f for f in processed_files if f.get("status") == "completed"])
+        processing_count = len([f for f in processed_files if f.get("status") == "processing"])
+        
+        sync_summary = f"✅ State sync complete: {completed_count} completed, {processing_count} processing"
+        if updated_count > 0 or added_count > 0:
+            sync_summary += f" (updated: {updated_count}, added: {added_count})"
+        logger.info(sync_summary)
+        
+        return state
+        
+    except Exception as e:
+        logger.error(f"Failed to sync state with GitHub: {e}")
+        return load_processed_files_state()
+
+def get_next_unprocessed_file() -> Optional[pathlib.Path]:
+    """Get the next file that hasn't been processed yet."""
+    if not ISSUES_DIR.exists():
+        logger.error(f"Issues directory {ISSUES_DIR} does not exist")
+        return None
+    
+    # Get all markdown files and sort them
+    md_files = sorted(ISSUES_DIR.glob("*.md"))
+    
+    if not md_files:
+        logger.info("No markdown files found in issues directory")
+        return None
+    
+    # Sync state with GitHub first to ensure accuracy
+    state = sync_processed_files_with_github()
+    processed_files = state.get("processed_files", [])
+    
+    # Get list of processed filenames
+    processed_filenames = set()
+    currently_processing = None
+    
+    for file_entry in processed_files:
+        filename = file_entry.get("filename")
+        status = file_entry.get("status")
+        
+        if status == "completed":
+            processed_filenames.add(filename)
+        elif status == "processing":
+            currently_processing = filename
+    
+    # If there's a file currently being processed, return None (wait for it to complete)
+    if currently_processing:
+        logger.info(f"File {currently_processing} is currently being processed")
+        return None
+    
+    # Find the first unprocessed file
+    for file_path in md_files:
+        filename = file_path.name
+        if filename not in processed_filenames:
+            logger.info(f"Found next unprocessed file: {filename}")
+            return file_path
+    
+    logger.info("All files have been processed")
+    return None
+
 def get_last_bot_issue() -> Optional[Dict[str, Any]]:
     """Get the most recently created bot issue (open or closed)."""
     params = {
@@ -300,6 +565,109 @@ def get_closing_pr_for_issue(issue_number: int) -> Optional[Dict[str, Any]]:
         logger.warning(f"Could not determine closing PR for issue #{issue_number}: {e}")
         return None
 
+def find_related_prs_for_issue(issue: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Find pull requests related to an issue using multiple strategies.
+    This handles cases where GitHub issue numbers don't match local file numbers.
+    """
+    issue_number = issue["number"]
+    issue_created_at = issue["created_at"]
+    linked_prs = []
+    
+    try:
+        # Get PRs created after the issue (with some buffer time)
+        from datetime import datetime, timedelta
+
+        # Parse ISO datetime string manually to avoid dependency
+        def parse_iso_datetime(iso_string):
+            # Simple ISO datetime parser for GitHub API format
+            # Format: 2023-12-25T10:30:00Z
+            try:
+                iso_string = iso_string.replace('Z', '+00:00')
+                return datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+            except:
+                # Fallback parsing
+                import re
+                match = re.match(r'(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})', iso_string)
+                if match:
+                    year, month, day, hour, minute, second = map(int, match.groups())
+                    return datetime(year, month, day, hour, minute, second)
+                return datetime.now()  # Fallback
+        
+        issue_created = parse_iso_datetime(issue_created_at)
+        # Look for PRs created within a reasonable timeframe after issue creation
+        
+        prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
+            "state": "all",
+            "sort": "created",
+            "direction": "desc",
+            "per_page": 50  # Increased to catch more potential matches
+        })
+        
+        for pr in prs:
+            pr_created_at = pr["created_at"]
+            pr_created = parse_iso_datetime(pr_created_at)
+            
+            # Skip PRs created before the issue (with 5 minute buffer)
+            if pr_created < issue_created - timedelta(minutes=5):
+                continue
+            
+            pr_body = pr.get("body", "") or ""
+            pr_title = pr.get("title", "")
+            pr_author = pr.get("user", {}).get("login", "")
+            
+            # Strategy 1: Direct issue number reference
+            direct_reference = (
+                f"#{issue_number}" in pr_body or f"#{issue_number}" in pr_title or
+                f"issue {issue_number}" in pr_body.lower() or 
+                f"fixes #{issue_number}" in pr_body.lower() or
+                f"closes #{issue_number}" in pr_body.lower()
+            )
+            
+            # Strategy 2: Check for [WIP] marker and Copilot authorship
+            wip_marker = "[WIP]" in pr_title.upper() or "[WIP]" in pr_body.upper()
+            
+            # Strategy 3: Time-based correlation for Copilot PRs
+            # If PR is from Copilot and created shortly after issue, it's likely related
+            time_diff = pr_created - issue_created
+            recent_copilot_pr = (
+                pr_author == "copilot-swe-agent" and 
+                time_diff <= timedelta(hours=24)  # Within 24 hours
+            )
+            
+            # Strategy 4: Extract file number from issue title and look for it in PR
+            file_number = extract_issue_number_from_title(issue["title"])
+            file_reference = False
+            if file_number is not None:
+                file_ref_patterns = [
+                    f"{file_number:03d}",  # 001, 002, etc.
+                    f"#{file_number}",     # #1, #2, etc.
+                    f"issue {file_number}",  # issue 1, issue 2, etc.
+                ]
+                file_reference = any(pattern in pr_title.lower() or pattern in pr_body.lower() 
+                                   for pattern in file_ref_patterns)
+            
+            # Check if this PR matches any of our strategies
+            if pr_author == "copilot-swe-agent" and (
+                direct_reference or 
+                (wip_marker and recent_copilot_pr) or
+                (recent_copilot_pr and file_reference)
+            ):
+                linked_prs.append(pr)
+                logger.debug(f"Found related Copilot PR #{pr['number']} for issue #{issue_number}")
+                logger.debug(f"  - Direct reference: {direct_reference}")
+                logger.debug(f"  - WIP marker: {wip_marker}")
+                logger.debug(f"  - Recent Copilot PR: {recent_copilot_pr}")
+                logger.debug(f"  - File reference: {file_reference}")
+        
+        # Sort by creation time, most recent first
+        linked_prs.sort(key=lambda x: x["created_at"], reverse=True)
+        
+    except Exception as e:
+        logger.warning(f"Could not search for related PRs: {e}")
+    
+    return linked_prs
+
 def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
     """
     Check the current status of the Copilot workflow for an issue.
@@ -350,40 +718,13 @@ def check_copilot_workflow_status(issue: Dict[str, Any]) -> str:
                     copilot_finished = True
                     logger.debug(f"Found Copilot work completion event for issue #{issue_number}")
         
-        # Look for linked pull requests
-        linked_prs = []
-        try:
-            # Check for pull requests that reference this issue
-            prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
-                "state": "all",
-                "sort": "updated",
-                "direction": "desc",
-                "per_page": 20
-            })
-            
-            for pr in prs:
-                pr_body = pr.get("body", "") or ""
-                pr_title = pr.get("title", "")
-                
-                # Check if PR references this issue
-                if (f"#{issue_number}" in pr_body or f"#{issue_number}" in pr_title or
-                    f"issue {issue_number}" in pr_body.lower() or 
-                    f"fixes #{issue_number}" in pr_body.lower() or
-                    f"closes #{issue_number}" in pr_body.lower()):
-                    
-                    # Check if PR is from Copilot
-                    pr_author = pr.get("user", {}).get("login", "")
-                    if pr_author == "copilot-swe-agent":
-                        linked_prs.append(pr)
-                        logger.debug(f"Found Copilot PR #{pr['number']} linked to issue #{issue_number}")
-        
-        except Exception as e:
-            logger.warning(f"Could not check for linked PRs: {e}")
+        # Use improved PR finding strategy
+        linked_prs = find_related_prs_for_issue(issue)
         
         # Determine status based on what we found
         if linked_prs:
             # Check the status of the most recent linked PR
-            latest_pr = max(linked_prs, key=lambda x: x["updated_at"])
+            latest_pr = linked_prs[0]  # Already sorted by creation time
             pr_state = latest_pr["state"]
             
             if pr_state == "closed":
@@ -435,22 +776,15 @@ def auto_approve_and_merge_pr(issue: Dict[str, Any]) -> bool:
     """Auto-approve and merge the PR associated with an issue."""
     issue_number = issue["number"]
     
-    # Find the related PR created by Copilot
-    prs = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/pulls", params={
-        "state": "open",
-        "sort": "updated",
-        "direction": "desc"
-    })
+    # Use improved PR finding to locate the related PR
+    related_prs = find_related_prs_for_issue(issue)
     
+    # Find the first open PR
     related_pr = None
-    for pr in prs:
-        # Check if PR is from Copilot and references this issue
-        pr_author = pr.get("user", {}).get("login", "")
-        if pr_author == "copilot-swe-agent":
-            pr_text = f"{pr['title']} {pr['body'] or ''}".lower()
-            if f"#{issue_number}" in pr_text or f"issue {issue_number}" in pr_text:
-                related_pr = pr
-                break
+    for pr in related_prs:
+        if pr["state"] == "open":
+            related_pr = pr
+            break
     
     if not related_pr:
         logger.error(f"No open Copilot PR found for issue #{issue_number}")
@@ -884,8 +1218,36 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
     """
     logger.info("Checking for next issue to promote...")
     
-    # 1. Get the last bot issue
-    last_issue = get_last_bot_issue()
+    # Check if we have resume context from startup
+    state = load_processed_files_state()
+    resume_context = state.get("resume_context")
+    
+    if resume_context and resume_context.get("active_issue"):
+        # We have an active issue from resume - use it instead of searching
+        active_issue_info = resume_context["active_issue"]
+        resume_action = resume_context.get("resume_action", "analyze_state")
+        
+        logger.info(f"📋 Resuming with active issue #{active_issue_info['number']}: {active_issue_info['title']}")
+        logger.info(f"🎯 Resume action: {resume_action}")
+        
+        # Get fresh issue data from GitHub
+        try:
+            last_issue = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues/{active_issue_info['number']}")
+        except Exception as e:
+            logger.error(f"Could not fetch active issue #{active_issue_info['number']}: {e}")
+            # Clear resume context and fall back to normal flow
+            if "resume_context" in state:
+                del state["resume_context"]
+                save_processed_files_state(state)
+            last_issue = get_last_bot_issue()
+        
+        # Clear resume context after first use
+        if "resume_context" in state:
+            del state["resume_context"]
+            save_processed_files_state(state)
+    else:
+        # Normal flow - get the last bot issue
+        last_issue = get_last_bot_issue()
     
     if last_issue:
         logger.info(f"Last bot issue: #{last_issue['number']} - {last_issue['title']}")
@@ -907,6 +1269,32 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
             success = auto_approve_and_merge_pr(last_issue)
             if success:
                 logger.info("Pull request merged successfully - workflow advancing")
+                
+                # Mark the corresponding file as completed
+                try:
+                    # Try to extract filename from issue title or find it by file number
+                    file_number = extract_issue_number_from_title(last_issue['title'])
+                    if file_number is not None:
+                        # Look for the file with this number
+                        pattern = f"{file_number:03d}-*.md"
+                        matching_files = list(ISSUES_DIR.glob(pattern))
+                        if matching_files:
+                            filename = matching_files[0].name
+                            mark_file_as_completed(filename)
+                            logger.info(f"Marked file {filename} as completed")
+                    
+                    # Alternative: check our state for files being processed
+                    state = load_processed_files_state()
+                    for file_entry in state.get("processed_files", []):
+                        if (file_entry.get("issue_number") == last_issue["number"] and 
+                            file_entry.get("status") == "processing"):
+                            mark_file_as_completed(file_entry["filename"])
+                            logger.info(f"Marked file {file_entry['filename']} as completed")
+                            break
+                            
+                except Exception as e:
+                    logger.warning(f"Could not mark file as completed: {e}")
+                
                 return True
             else:
                 logger.error("Failed to merge pull request - will retry")
@@ -915,24 +1303,39 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
         elif workflow_status == "completed":
             logger.info(f"Previous issue #{last_issue['number']} workflow is complete")
             
-            # Extract the issue number from the title to determine what's next
-            issue_number = extract_issue_number_from_title(last_issue['title'])
-            if issue_number is None:
-                logger.warning(f"Could not extract number from issue title: {last_issue['title']}")
-                logger.warning("Assuming this is the first processed issue")
-                issue_number = 0
+            # Mark the corresponding file as completed if not already done
+            try:
+                file_number = extract_issue_number_from_title(last_issue['title'])
+                if file_number is not None:
+                    pattern = f"{file_number:03d}-*.md"
+                    matching_files = list(ISSUES_DIR.glob(pattern))
+                    if matching_files:
+                        filename = matching_files[0].name
+                        mark_file_as_completed(filename)
+                        logger.info(f"Marked file {filename} as completed")
+                
+                # Alternative: check our state
+                state = load_processed_files_state()
+                for file_entry in state.get("processed_files", []):
+                    if (file_entry.get("issue_number") == last_issue["number"] and 
+                        file_entry.get("status") == "processing"):
+                        mark_file_as_completed(file_entry["filename"])
+                        logger.info(f"Marked file {file_entry['filename']} as completed")
+                        break
+                        
+            except Exception as e:
+                logger.warning(f"Could not mark file as completed: {e}")
         else:
             logger.warning(f"Unknown workflow status: {workflow_status}")
             return False
     else:
         logger.info("No previous bot issues found - starting from the beginning")
-        issue_number = None
     
-    # 3. Find the next file to process (only if previous workflow is complete)
-    if last_issue and workflow_status != "completed":
+    # 3. Find the next file to process (only if previous workflow is complete or no previous issue)
+    if last_issue and workflow_status not in ["completed"]:
         return False
     
-    next_file = get_next_file(issue_number)
+    next_file = get_next_unprocessed_file()
     
     if not next_file:
         logger.info("Queue is empty - no more issues to promote")
@@ -941,6 +1344,10 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
     # 4. Create the new issue with Copilot assignment
     try:
         new_issue = create_issue(next_file, copilot_info)
+        
+        # Mark the file as being processed
+        mark_file_as_processing(next_file.name, new_issue["number"])
+        
         logger.info("✅ New issue created and assigned to Copilot")
         logger.info(f"🤖 Copilot will automatically start working on issue #{new_issue['number']}")
         return True
@@ -948,9 +1355,255 @@ def promote_next_issue(copilot_info: Dict[str, Any]) -> bool:
         logger.error(f"Failed to create issue: {e}")
         return False
 
+def show_status():
+    """Show current status of processed files."""
+    logger.info("📊 Current Status Report")
+    logger.info("=" * 50)
+    
+    # Sync with GitHub first
+    state = sync_processed_files_with_github()
+    processed_files = state.get("processed_files", [])
+    
+    # Show resume context if available
+    resume_context = state.get("resume_context")
+    if resume_context:
+        logger.info("🔄 Resume Context:")
+        active_issue = resume_context.get("active_issue")
+        if active_issue:
+            logger.info(f"  Active Issue: #{active_issue['number']} - {active_issue['title']}")
+            logger.info(f"  Workflow Status: {active_issue['workflow_status']}")
+            logger.info(f"  Next Action: {resume_context.get('resume_action', 'unknown')}")
+        else:
+            logger.info(f"  Next Action: {resume_context.get('resume_action', 'unknown')}")
+        logger.info("")
+    
+    # Get all markdown files
+    if ISSUES_DIR.exists():
+        all_files = sorted(ISSUES_DIR.glob("*.md"))
+        logger.info(f"📁 Total files in issues directory: {len(all_files)}")
+    else:
+        all_files = []
+        logger.info("📁 Issues directory not found")
+    
+    # Count by status
+    completed = [f for f in processed_files if f.get("status") == "completed"]
+    processing = [f for f in processed_files if f.get("status") == "processing"]
+    
+    logger.info(f"✅ Completed files: {len(completed)}")
+    logger.info(f"🔄 Currently processing: {len(processing)}")
+    logger.info(f"⏳ Remaining files: {len(all_files) - len(completed) - len(processing)}")
+    
+    if processing:
+        logger.info("\n🔄 Currently Processing:")
+        for file_entry in processing:
+            logger.info(f"  - {file_entry.get('filename')} (Issue #{file_entry.get('issue_number')})")
+    
+    if completed:
+        logger.info(f"\n✅ Last 5 Completed Files:")
+        # Sort by completion time or file number
+        recent_completed = sorted(completed, key=lambda f: f.get("completed_at", ""), reverse=True)[:5]
+        for file_entry in recent_completed:
+            logger.info(f"  - {file_entry.get('filename')} (Issue #{file_entry.get('issue_number')})")
+    
+    # Show next file to process
+    next_file = None
+    try:
+        processed_filenames = {f.get("filename") for f in processed_files if f.get("status") in ["completed", "processing"]}
+        for file_path in all_files:
+            if file_path.name not in processed_filenames:
+                next_file = file_path.name
+                break
+    except Exception as e:
+        logger.warning(f"Could not determine next file: {e}")
+    
+    if next_file:
+        logger.info(f"\n⏭️  Next file to process: {next_file}")
+    else:
+        logger.info(f"\n🎉 All files have been processed!")
+    
+    logger.info("=" * 50)
+
+def resume_bot_state(copilot_info: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Resume bot state by analyzing GitHub repository and updating local state.
+    This handles bot restarts by checking:
+    1. Active bot issues and their workflow states
+    2. Files that should be marked as completed
+    3. Files that are currently in progress
+    4. What the next action should be
+    """
+    logger.info("🔄 Resuming bot state from GitHub repository...")
+    
+    # First sync our state with GitHub
+    state = sync_processed_files_with_github()
+    
+    # Get all bot issues (open and closed) to understand current state
+    try:
+        params = {
+            "labels": LABEL,
+            "state": "all",
+            "sort": "created",
+            "direction": "desc",  # Most recent first
+            "per_page": 50
+        }
+        
+        all_bot_issues = api_request(f"/repos/{REPO_OWNER}/{REPO_NAME}/issues", params=params)
+        logger.info(f"Found {len(all_bot_issues)} total bot issues in repository")
+        
+        # Analyze the most recent open bot issue (if any)
+        open_issues = [issue for issue in all_bot_issues if issue["state"] == "open"]
+        
+        if open_issues:
+            latest_open_issue = open_issues[0]  # Most recent open issue
+            logger.info(f"Latest open bot issue: #{latest_open_issue['number']} - {latest_open_issue['title']}")
+            
+            # Check its workflow status
+            workflow_status = check_copilot_workflow_status(latest_open_issue)
+            logger.info(f"Current workflow status: {workflow_status}")
+            
+            # Find corresponding local file
+            file_number = extract_issue_number_from_title(latest_open_issue['title'])
+            corresponding_file = None
+            
+            if file_number is not None:
+                pattern = f"{file_number:03d}-*.md"
+                matching_files = list(ISSUES_DIR.glob(pattern))
+                if matching_files:
+                    corresponding_file = matching_files[0].name
+            
+            # Update local state based on GitHub workflow state
+            if corresponding_file:
+                processed_files = state.get("processed_files", [])
+                
+                # Find existing entry or create new one
+                file_entry = None
+                for entry in processed_files:
+                    if entry.get("filename") == corresponding_file:
+                        file_entry = entry
+                        break
+                
+                if not file_entry:
+                    # Create new entry for this file
+                    logger.info(f"Creating state entry for active issue file: {corresponding_file}")
+                    file_entry = {
+                        "filename": corresponding_file,
+                        "issue_number": latest_open_issue["number"],
+                        "status": "processing",
+                        "created_at": latest_open_issue["created_at"]
+                    }
+                    processed_files.append(file_entry)
+                else:
+                    # Update existing entry
+                    file_entry["issue_number"] = latest_open_issue["number"]
+                    file_entry["status"] = "processing"
+                
+                state["processed_files"] = processed_files
+                save_processed_files_state(state)
+                
+                logger.info(f"✅ Updated state for active file: {corresponding_file} (Issue #{latest_open_issue['number']})")
+            
+            # Store current active issue info for resume context
+            state["resume_context"] = {
+                "active_issue": {
+                    "number": latest_open_issue["number"],
+                    "title": latest_open_issue["title"],
+                    "workflow_status": workflow_status,
+                    "file": corresponding_file
+                },
+                "resume_action": determine_resume_action(workflow_status),
+                "resumed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            }
+            
+        else:
+            logger.info("No open bot issues found - ready to start fresh")
+            state["resume_context"] = {
+                "active_issue": None,
+                "resume_action": "create_next",
+                "resumed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            }
+        
+        # Double-check completed issues to ensure accuracy
+        completed_issues = [issue for issue in all_bot_issues if issue["state"] == "closed"]
+        logger.info(f"Found {len(completed_issues)} completed bot issues")
+        
+        # Ensure all completed issues are properly marked in our state
+        for closed_issue in completed_issues:
+            if is_issue_done(closed_issue):
+                file_number = extract_issue_number_from_title(closed_issue['title'])
+                if file_number is not None:
+                    pattern = f"{file_number:03d}-*.md"
+                    matching_files = list(ISSUES_DIR.glob(pattern))
+                    if matching_files:
+                        filename = matching_files[0].name
+                        
+                        # Check if this file is properly marked as completed
+                        processed_files = state.get("processed_files", [])
+                        file_entry = None
+                        for entry in processed_files:
+                            if entry.get("filename") == filename:
+                                file_entry = entry
+                                break
+                        
+                        if not file_entry or file_entry.get("status") != "completed":
+                            logger.info(f"Marking completed issue file as done: {filename}")
+                            mark_file_as_completed(filename)
+        
+        save_processed_files_state(state)
+        
+        # Log resume summary
+        resume_context = state.get("resume_context", {})
+        active_issue = resume_context.get("active_issue")
+        resume_action = resume_context.get("resume_action", "unknown")
+        
+        if active_issue:
+            logger.info(f"🎯 Resume Action: {resume_action}")
+            logger.info(f"📋 Active Issue: #{active_issue['number']} ({active_issue['workflow_status']})")
+        else:
+            logger.info(f"🎯 Resume Action: {resume_action}")
+        
+        return state
+        
+    except Exception as e:
+        logger.error(f"Failed to resume bot state: {e}")
+        logger.warning("Continuing with existing local state...")
+        return load_processed_files_state()
+
+def determine_resume_action(workflow_status: str) -> str:
+    """Determine what action to take based on workflow status."""
+    action_map = {
+        "waiting_for_copilot": "monitor_copilot",
+        "copilot_working": "monitor_copilot", 
+        "pr_ready_for_review": "review_and_merge",
+        "completed": "create_next"
+    }
+    return action_map.get(workflow_status, "analyze_state")
+
 def main():
     """Main entry point."""
+    # Check for help command
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print(__doc__)
+        return
+    
+    # Check for status command
+    if "--status" in sys.argv:
+        show_status()
+        return
+    
+    # Check for resume/sync command
+    if "--resume" in sys.argv or "--sync" in sys.argv:
+        copilot_info = validate_environment()
+        logger.info("🔄 Performing complete state sync and resume analysis...")
+        resume_state = resume_bot_state(copilot_info)
+        show_status()
+        logger.info("✅ State sync complete. Use --continuous to start bot with this state.")
+        return
+    
     copilot_info = validate_environment()
+    
+    # Resume bot state on startup
+    logger.info("🚀 Starting GitHub Issue Queue Bot...")
+    resume_state = resume_bot_state(copilot_info)
     
     # Check if we're in continuous mode
     continuous = "--continuous" in sys.argv or "--daemon" in sys.argv
